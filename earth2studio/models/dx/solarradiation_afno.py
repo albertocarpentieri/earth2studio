@@ -25,7 +25,6 @@ from earth2studio.models.auto import AutoModelMixin, Package
 from earth2studio.models.batch import batch_coords, batch_func
 from earth2studio.models.dx.base import DiagnosticModel
 from earth2studio.models.nn.afno_ssrd import SolarRadiationNet
-from earth2studio.models.nn.afno_precip import PrecipNet
 from earth2studio.utils import (
     handshake_coords,
     handshake_dim,
@@ -168,26 +167,26 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
         model = PrecipNet.from_checkpoint(
             str(
                 checkpoint_zip.parent
-                / Path("precipitation_afno/ssrd_afno.mdlus")
+                / Path("solarradiation_afno/ssrd_afno.mdlus")
             )
         )
         model.eval()
 
         input_mean = torch.Tensor(
             np.load(
-                str(checkpoint_zip.parent / Path("precipitation_afno/global_means.npy"))
+                str(checkpoint_zip.parent / Path("solarradiation_afno/global_means.npy"))
             )
         )
         
         input_std = torch.Tensor(
             np.load(
-                str(checkpoint_zip.parent / Path("precipitation_afno/global_stds.npy"))
+                str(checkpoint_zip.parent / Path("solarradiation_afno/global_stds.npy"))
             )
         )
         
         input_z = torch.Tensor(
             np.load(
-                str(checkpoint_zip.parent / Path("precipitation_afno/orography.npy"))
+                str(checkpoint_zip.parent / Path("solarradiation_afno/orography.npy"))
             )
         )
         input_z = (input_z - inpu_z.mean()) / input_z.std()
@@ -195,14 +194,14 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
         
         input_lsm = torch.Tensor(
             np.load(
-                str(checkpoint_zip.parent / Path("precipitation_afno/land_sea_mask.npy"))
+                str(checkpoint_zip.parent / Path("solarradiation_afno/land_sea_mask.npy"))
             )
         )
         input_lsm = input_lsm.expand(input_lsm.shape[:1] + (2,) + input_lsm.shape[2:])
         
         input_latlon = torch.Tensor(
             np.load(
-                str(checkpoint_zip.parent / Path("precipitation_afno/latlon.npy"))
+                str(checkpoint_zip.parent / Path("solarradiation_afno/latlon.npy"))
             )
         )
         input_latlon = input_latlon.expand(input_latlon.shape[:1] + (2,) + input_latlon.shape[2:])
