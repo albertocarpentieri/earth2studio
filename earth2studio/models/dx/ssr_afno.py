@@ -203,5 +203,4 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
         x = # need to concatenate the data
         x = (x - self.mean) / self.std
         out = self.core_model(x)*self.ssrd_std + self.ssrd_mean
-
-        return out, output_coords  # Softmax channels
+        return out, output_coords
