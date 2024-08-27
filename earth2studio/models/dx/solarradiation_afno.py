@@ -24,6 +24,7 @@ import torch
 from earth2studio.models.auto import AutoModelMixin, Package
 from earth2studio.models.batch import batch_coords, batch_func
 from earth2studio.models.dx.base import DiagnosticModel
+from earth2studio.models.nn.afno_ssrd import SolarRadiationNet
 from earth2studio.models.nn.afno_precip import PrecipNet
 from earth2studio.utils import (
     handshake_coords,
@@ -71,6 +72,12 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
         Model mean normalization tensor of size [31,1,1]
     std : torch.Tensor
         Model standard deviation normalization tensor of size [31,1,1]
+    landsea_mask : torch.Tensor
+        Land sea mask
+    orography : torch.Tensor
+        Surface geopotential (orography) 
+    latlon: torch.Tensor
+        4 fields embedding location information (cos(lat), sin(lat), cos(lon), sin(lon))
     """
 
     def __init__(
@@ -78,17 +85,19 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
         core_model: torch.nn.Module,
         mean: torch.Tensor,
         std: torch.Tensor,
+        ssrd_mean: torch.Tensor,
+        ssrd_std: torch.Tensor,
         orography: torch.Tensor,
-        land_sea_mask: torch.Tensor,
+        landsea_mask: torch.Tensor,
         latlon: torch.Tensor
     ):
         super().__init__()
         self.core_model = core_model
         self.register_buffer("mean", mean)
         self.register_buffer("std", std)
-        self.register_buffer("orography", std)
-        self.register_buffer("land_sea_mask", std)
-        self.register_buffer("latlon", std)
+        self.register_buffer("orography", orography)
+        self.register_buffer("landsea_mask", landsea_mask)
+        self.register_buffer("latlon", latlon)
 
     def input_coords(self) -> CoordSystem:
         """Input coordinate system of diagnostic model
@@ -169,27 +178,35 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
                 str(checkpoint_zip.parent / Path("precipitation_afno/global_means.npy"))
             )
         )
+        
         input_std = torch.Tensor(
             np.load(
                 str(checkpoint_zip.parent / Path("precipitation_afno/global_stds.npy"))
             )
         )
-        input_std = torch.Tensor(
+        
+        input_z = torch.Tensor(
             np.load(
                 str(checkpoint_zip.parent / Path("precipitation_afno/orography.npy"))
             )
         )
-        input_std = torch.Tensor(
+        input_z = (input_z - inpu_z.mean()) / input_z.std()
+        input_z = input_z.expand(input_z.shape[:1] + (2,) + input_z.shape[2:])
+        
+        input_lsm = torch.Tensor(
             np.load(
                 str(checkpoint_zip.parent / Path("precipitation_afno/land_sea_mask.npy"))
             )
         )
-        input_std = torch.Tensor(
+        input_lsm = input_lsm.expand(input_lsm.shape[:1] + (2,) + input_lsm.shape[2:])
+        
+        input_latlon = torch.Tensor(
             np.load(
                 str(checkpoint_zip.parent / Path("precipitation_afno/latlon.npy"))
             )
         )
-        return cls(model, input_center, input_scale)
+        input_latlon = input_latlon.expand(input_latlon.shape[:1] + (2,) + input_latlon.shape[2:])
+        return cls(model, input_center, input_scale, input_z, input_lsm, input_latlon)
 
     @torch.inference_mode()
     @batch_func()
@@ -200,7 +217,7 @@ class SolarRadiationAFNO(torch.nn.Module, AutoModelMixin):
     ) -> tuple[torch.Tensor, CoordSystem]:
         """Forward pass of diagnostic"""
         output_coords = self.output_coords(coords)
-        x = # need to concatenate the data
         x = (x - self.mean) / self.std
+        x = torch.cat((x, self.latlon, self.orography, self.landsea_mask), dim=2)
         out = self.core_model(x)*self.ssrd_std + self.ssrd_mean
         return out, output_coords
