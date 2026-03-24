@@ -16,11 +16,11 @@
 
 # %%
 """
-StormCast Ensemble 100 m Wind Interpolation
+StormCast Ensemble 80 m Wind Interpolation
 ===========================================
 
 Run a short StormCast ensemble forecast, then interpolate hybrid-level winds
-to 100 m AGL using:
+to 80 m AGL using:
 
   H_agl = Zhl / 9.81
 
@@ -37,9 +37,12 @@ from __future__ import annotations
 
 import os
 import re
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
+import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import xarray as xr
 from dotenv import load_dotenv
 from loguru import logger
@@ -50,6 +53,7 @@ from earth2studio.data import HRRR
 from earth2studio.io import ZarrBackend
 from earth2studio.models.px import StormCast
 from earth2studio.perturbation import Zero
+from earth2studio.statistics import mae, mean, rmse
 
 logger.remove()
 logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
@@ -58,9 +62,9 @@ os.makedirs("outputs", exist_ok=True)
 load_dotenv()
 
 G0 = 9.81
-TARGET_AGL_M = 100.0
+TARGET_AGL_M = 80.0
 N_STEPS = 2
-ENSEMBLE_SIZE = 4
+ENSEMBLE_SIZE = 2
 BATCH_SIZE = 2
 
 
@@ -96,7 +100,9 @@ def _interp_uv_to_height(
     and ensemble outputs.
     """
     if not (u.shape == v.shape == h.shape):
-        raise ValueError(f"u/v/h shapes must match; got {u.shape}, {v.shape}, {h.shape}")
+        raise ValueError(
+            f"u/v/h shapes must match; got {u.shape}, {v.shape}, {h.shape}"
+        )
 
     nlev = h.shape[lev_axis]
     if nlev < 2:
@@ -122,13 +128,116 @@ def _interp_uv_to_height(
     return u_t, v_t
 
 
+def _metric_dict(pred: np.ndarray, truth: np.ndarray) -> dict[str, float]:
+    """Return aggregate metrics using earth2studio statistics classes."""
+    valid = np.isfinite(pred) & np.isfinite(truth)
+    n = int(np.sum(valid))
+    if n == 0:
+        return {"n": 0, "bias": np.nan, "mae": np.nan, "rmse": np.nan, "corr": np.nan}
+
+    # Reduce over a single axis so we can safely ignore invalid points.
+    p = torch.as_tensor(pred[valid], dtype=torch.float32)
+    t = torch.as_tensor(truth[valid], dtype=torch.float32)
+    coords = OrderedDict({"sample": np.arange(n, dtype=np.int64)})
+
+    bias_t, _ = mean(["sample"])(p - t, coords)
+    mae_t, _ = mae(["sample"])(p, coords, t, coords)
+    rmse_t, _ = rmse(["sample"])(p, coords, t, coords)
+
+    # Pearson correlation is not part of the standard e2studio metric classes.
+    corr = np.corrcoef(p.cpu().numpy(), t.cpu().numpy())[0, 1] if n > 1 else np.nan
+    return {
+        "n": n,
+        "bias": float(bias_t.item()),
+        "mae": float(mae_t.item()),
+        "rmse": float(rmse_t.item()),
+        "corr": float(corr),
+    }
+
+
+def _plot_error_and_scatter(
+    pred: xr.DataArray,
+    truth: xr.DataArray,
+    var_name: str,
+    out_prefix: str,
+) -> None:
+    """Save prediction, truth, and error maps side-by-side."""
+    # Pick a representative slice (first ensemble member if present, first time/lead).
+    sel_indexers = {}
+    if "ensemble" in pred.dims:
+        sel_indexers["ensemble"] = 0
+    if "time" in pred.dims:
+        sel_indexers["time"] = 0
+    if "lead_time" in pred.dims:
+        sel_indexers["lead_time"] = 0
+
+    pred2d = pred.isel(**sel_indexers)
+    truth2d = truth.isel(**sel_indexers)
+    err2d = pred2d - truth2d
+
+    # Use shared range for pred/truth to make comparison fair.
+    pred_vals = pred2d.values
+    truth_vals = truth2d.values
+    finite_pt = np.isfinite(pred_vals) & np.isfinite(truth_vals)
+    if np.any(finite_pt):
+        vmin = float(
+            np.nanmin(np.concatenate([pred_vals[finite_pt], truth_vals[finite_pt]]))
+        )
+        vmax = float(
+            np.nanmax(np.concatenate([pred_vals[finite_pt], truth_vals[finite_pt]]))
+        )
+    else:
+        vmin, vmax = -1.0, 1.0
+
+    # Symmetric color scale for error.
+    err_vals = err2d.values
+    finite_e = np.isfinite(err_vals)
+    if np.any(finite_e):
+        emax = float(np.nanmax(np.abs(err_vals[finite_e])))
+    else:
+        emax = 1.0
+    emax = max(emax, 1e-6)
+
+    plt.close("all")
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    im0 = axes[0].imshow(
+        pred_vals, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax
+    )
+    axes[0].set_title(f"{var_name} prediction")
+    axes[0].set_xlabel("hrrr_x")
+    axes[0].set_ylabel("hrrr_y")
+    fig.colorbar(im0, ax=axes[0], shrink=0.8)
+
+    im1 = axes[1].imshow(
+        truth_vals, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax
+    )
+    axes[1].set_title(f"{var_name} truth")
+    axes[1].set_xlabel("hrrr_x")
+    axes[1].set_ylabel("hrrr_y")
+    fig.colorbar(im1, ax=axes[1], shrink=0.8)
+
+    im2 = axes[2].imshow(err_vals, origin="lower", cmap="RdBu_r", vmin=-emax, vmax=emax)
+    axes[2].set_title(f"{var_name} error (pred - truth)")
+    axes[2].set_xlabel("hrrr_x")
+    axes[2].set_ylabel("hrrr_y")
+    fig.colorbar(im2, ax=axes[2], shrink=0.8)
+
+    fig.tight_layout()
+    out_path = f"outputs/{out_prefix}_{var_name}_diagnostics.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot: {out_path}")
+
+
 # %%
 # Run a short StormCast ensemble forecast and save to Zarr.
 package = StormCast.load_default_package()
 model = StormCast.load_model(package)
 data = HRRR()
 perturb = Zero()
-io = ZarrBackend(file_name="outputs/stormcast_raw_ensemble.zarr", backend_kwargs={"overwrite": True})
+io = ZarrBackend(
+    file_name="outputs/stormcast_raw_ensemble.zarr", backend_kwargs={"overwrite": True}
+)
 
 today = datetime.today() - timedelta(days=1)
 date = today.isoformat().split("T")[0]
@@ -147,7 +256,7 @@ print("Raw StormCast output saved:", "outputs/stormcast_raw_ensemble.zarr")
 print(f"Ensemble settings: ensemble_size={ENSEMBLE_SIZE}, batch_size={BATCH_SIZE}")
 
 # %%
-# Load output and interpolate hybrid-level winds to 100 m AGL.
+# Load output and interpolate hybrid-level winds to 80 m AGL.
 ds = xr.open_zarr("outputs/stormcast_raw_ensemble.zarr")
 
 z_names, z_levels = _collect_hl_names(ds, "Z")
@@ -161,9 +270,16 @@ if not (z_levels == u_levels == v_levels):
         f"Level mismatch across Z/u/v hybrid fields: {z_levels}, {u_levels}, {v_levels}"
     )
 
-z_da = xr.concat([ds[name] for name in z_names], dim=xr.DataArray(z_levels, dims="level")) / G0
-u_da = xr.concat([ds[name] for name in u_names], dim=xr.DataArray(u_levels, dims="level"))
-v_da = xr.concat([ds[name] for name in v_names], dim=xr.DataArray(v_levels, dims="level"))
+z_da = (
+    xr.concat([ds[name] for name in z_names], dim=xr.DataArray(z_levels, dims="level"))
+    / G0
+)
+u_da = xr.concat(
+    [ds[name] for name in u_names], dim=xr.DataArray(u_levels, dims="level")
+)
+v_da = xr.concat(
+    [ds[name] for name in v_names], dim=xr.DataArray(v_levels, dims="level")
+)
 
 spatial_dims = ("hrrr_y", "hrrr_x")
 for dim in spatial_dims:
@@ -177,34 +293,156 @@ u_da = u_da.transpose(*ordered_dims)
 v_da = v_da.transpose(*ordered_dims)
 
 lev_axis = len(lead_dims)
-u100, v100 = _interp_uv_to_height(
+u80, v80 = _interp_uv_to_height(
     u_da.values,
     v_da.values,
     z_da.values,
     TARGET_AGL_M,
     lev_axis=lev_axis,
 )
-ws100 = np.hypot(u100, v100)
 
 out_dims = tuple(lead_dims + list(spatial_dims))
 coords = {d: z_da.coords[d].values for d in out_dims}
 
 out = xr.Dataset(
     data_vars={
-        "u100m": xr.DataArray(u100, dims=out_dims, coords=coords),
-        "v100m": xr.DataArray(v100, dims=out_dims, coords=coords),
-        "ws100m": xr.DataArray(ws100, dims=out_dims, coords=coords),
+        "u80m": xr.DataArray(u80, dims=out_dims, coords=coords),
+        "v80m": xr.DataArray(v80, dims=out_dims, coords=coords),
     },
     attrs={
-        "description": "100 m AGL wind interpolated from StormCast hybrid levels",
+        "description": "80 m AGL wind interpolated from StormCast hybrid levels",
         "height_assumption": "H_agl = Zhl / 9.81",
         "target_height_m": TARGET_AGL_M,
         "ensemble_size": ENSEMBLE_SIZE,
         "batch_size": BATCH_SIZE,
-        "levels_used": ",".join(str(l) for l in z_levels),
+        "levels_used": ",".join(str(level) for level in z_levels),
     },
 )
 
-out.to_zarr("outputs/stormcast_100m_wind_ensemble.zarr", mode="w")
-print("100 m wind output saved:", "outputs/stormcast_100m_wind_ensemble.zarr")
+out.to_zarr("outputs/stormcast_80m_wind_ensemble.zarr", mode="w")
+print("80 m wind output saved:", "outputs/stormcast_80m_wind_ensemble.zarr")
 print("Interpolated variables:", list(out.data_vars))
+
+# %%
+# Compute errors vs HRRR truth (u10m/v10m and u80m/v80m) at corresponding valid times.
+if "time" not in out.coords or "lead_time" not in out.coords:
+    raise RuntimeError(
+        "Expected 'time' and 'lead_time' coordinates to compute truth errors."
+    )
+
+valid_times = out["time"].values[:, None].astype("datetime64[ns]") + out[
+    "lead_time"
+].values[None, :].astype("timedelta64[ns]")
+unique_valid_times = np.unique(valid_times.reshape(-1))
+
+hrrr_truth = HRRR()(unique_valid_times, ["u10m", "v10m", "u80m", "v80m"])
+hrrr_truth = hrrr_truth.sel(
+    hrrr_y=xr.DataArray(out["hrrr_y"].values, dims="hrrr_y"),
+    hrrr_x=xr.DataArray(out["hrrr_x"].values, dims="hrrr_x"),
+    method="nearest",
+)
+
+truth_times = hrrr_truth["time"].values.astype("datetime64[ns]")
+time_to_idx = {int(t.astype("int64")): i for i, t in enumerate(truth_times)}
+time_keys = valid_times.astype("datetime64[ns]").astype("int64")
+
+nt = out.sizes["time"]
+nl = out.sizes["lead_time"]
+ny = out.sizes["hrrr_y"]
+nx = out.sizes["hrrr_x"]
+
+u10_idx = int(np.where(hrrr_truth["variable"].values == "u10m")[0][0])
+v10_idx = int(np.where(hrrr_truth["variable"].values == "v10m")[0][0])
+u80_idx = int(np.where(hrrr_truth["variable"].values == "u80m")[0][0])
+v80_idx = int(np.where(hrrr_truth["variable"].values == "v80m")[0][0])
+hrrr_vals = hrrr_truth.values  # [time, variable, y, x]
+
+truth_u10 = np.full((nt, nl, ny, nx), np.nan, dtype=np.float32)
+truth_v10 = np.full((nt, nl, ny, nx), np.nan, dtype=np.float32)
+truth_u80 = np.full((nt, nl, ny, nx), np.nan, dtype=np.float32)
+truth_v80 = np.full((nt, nl, ny, nx), np.nan, dtype=np.float32)
+for i in range(nt):
+    for j in range(nl):
+        idx = time_to_idx.get(int(time_keys[i, j]))
+        if idx is not None:
+            truth_u10[i, j] = hrrr_vals[idx, u10_idx]
+            truth_v10[i, j] = hrrr_vals[idx, v10_idx]
+            truth_u80[i, j] = hrrr_vals[idx, u80_idx]
+            truth_v80[i, j] = hrrr_vals[idx, v80_idx]
+
+truth_coords = {
+    "time": out["time"].values,
+    "lead_time": out["lead_time"].values,
+    "hrrr_y": out["hrrr_y"].values,
+    "hrrr_x": out["hrrr_x"].values,
+}
+out_u10 = ds["u10m"].transpose(*out_dims)
+out_v10 = ds["v10m"].transpose(*out_dims)
+
+truth_u10_da = xr.DataArray(
+    truth_u10,
+    dims=("time", "lead_time", "hrrr_y", "hrrr_x"),
+    coords=truth_coords,
+).broadcast_like(out_u10)
+truth_v10_da = xr.DataArray(
+    truth_v10,
+    dims=("time", "lead_time", "hrrr_y", "hrrr_x"),
+    coords=truth_coords,
+).broadcast_like(out_v10)
+truth_u80_da = xr.DataArray(
+    truth_u80,
+    dims=("time", "lead_time", "hrrr_y", "hrrr_x"),
+    coords=truth_coords,
+).broadcast_like(out["u80m"])
+truth_v80_da = xr.DataArray(
+    truth_v80,
+    dims=("time", "lead_time", "hrrr_y", "hrrr_x"),
+    coords=truth_coords,
+).broadcast_like(out["v80m"])
+
+err = xr.Dataset(
+    data_vars={
+        "u10m_truth": truth_u10_da,
+        "v10m_truth": truth_v10_da,
+        "u10m_error": out_u10 - truth_u10_da,
+        "v10m_error": out_v10 - truth_v10_da,
+        "u80m_truth": truth_u80_da,
+        "v80m_truth": truth_v80_da,
+        "u80m_error": out["u80m"] - truth_u80_da,
+        "v80m_error": out["v80m"] - truth_v80_da,
+    },
+    attrs={
+        "description": "Errors for StormCast 80 m wind interpolation vs HRRR truth",
+        "truth_source": "HRRR u10m/v10m and u80m/v80m",
+    },
+)
+err.to_zarr("outputs/stormcast_80m_wind_errors_ensemble.zarr", mode="w")
+print("Error output saved:", "outputs/stormcast_80m_wind_errors_ensemble.zarr")
+
+u10_metrics = _metric_dict(out_u10.values, truth_u10_da.values)
+v10_metrics = _metric_dict(out_v10.values, truth_v10_da.values)
+u80_metrics = _metric_dict(out["u80m"].values, truth_u80_da.values)
+v80_metrics = _metric_dict(out["v80m"].values, truth_v80_da.values)
+print("\nOverall metrics vs HRRR truth:")
+print("u10m:", u10_metrics)
+print("v10m:", v10_metrics)
+print("u80m:", u80_metrics)
+print("v80m:", v80_metrics)
+
+if "ensemble" in out.dims:
+    ens_mean_u10 = out_u10.mean(dim="ensemble").values
+    ens_mean_v10 = out_v10.mean(dim="ensemble").values
+    ens_mean_u = out["u80m"].mean(dim="ensemble").values
+    ens_mean_v = out["v80m"].mean(dim="ensemble").values
+    print("\nEnsemble-mean metrics vs HRRR truth:")
+    print("u10m:", _metric_dict(ens_mean_u10, truth_u10))
+    print("v10m:", _metric_dict(ens_mean_v10, truth_v10))
+    print("u80m:", _metric_dict(ens_mean_u, truth_u80))
+    print("v80m:", _metric_dict(ens_mean_v, truth_v80))
+
+# %%
+# Quick plots for visual diagnostics.
+_plot_error_and_scatter(out_u10, truth_u10_da, "u10m", "stormcast")
+_plot_error_and_scatter(out_v10, truth_v10_da, "v10m", "stormcast")
+_plot_error_and_scatter(out["u80m"], truth_u80_da, "u80m", "stormcast")
+_plot_error_and_scatter(out["v80m"], truth_v80_da, "v80m", "stormcast")
