@@ -81,6 +81,8 @@ BATCH_SIZE = 2
 CALIB_HOURS = 6
 HRRR_FIT_TIME = datetime(2025, 1, 15, 0, 0, 0)
 HRRR_TEST_TIME = datetime(2025, 1, 15, 1, 0, 0)
+HRRR_TEST_TIME_PLUS6 = datetime(2025, 1, 15, 6, 0, 0)
+HRRR_TEST_TIME_PLUS12 = datetime(2025, 1, 15, 12, 0, 0)
 
 
 def _close_hrrr_sessions(*sources: object) -> None:
@@ -279,6 +281,18 @@ def _evaluate_and_plot(
         print(f"\nMethod: {name}")
         print("u80m:", metric_dict(up, truth_u_b))
         print("v80m:", metric_dict(vp, truth_v_b))
+        lead_axis = out_dims.index("lead_time")
+        lead_vals = ds["lead_time"].values
+        print("u80m by lead:")
+        for li, lv in enumerate(lead_vals):
+            up_i = np.take(up, li, axis=lead_axis)
+            tu_i = np.take(truth_u_b, li, axis=lead_axis)
+            print(f"  lead={lv}: {metric_dict(up_i, tu_i)}")
+        print("v80m by lead:")
+        for li, lv in enumerate(lead_vals):
+            vp_i = np.take(vp, li, axis=lead_axis)
+            tv_i = np.take(truth_v_b, li, axis=lead_axis)
+            print(f"  lead={lv}: {metric_dict(vp_i, tv_i)}")
 
     lead_hours = ds["lead_time"].values.astype("timedelta64[h]").astype(int)
     plt.close("all")
@@ -319,15 +333,29 @@ def _evaluate_and_plot(
 
 
 def run_hrrr_only() -> None:
-    """Run HRRR-only benchmark with fixed fit/test timestamps 1 hour apart."""
+    """Run HRRR-only benchmark with fixed fit time and +1h/+6h/+12h tests."""
     print("\n=== HRRR-only comparison ===")
     hrrr = HRRR()
     if HRRR_TEST_TIME - HRRR_FIT_TIME != timedelta(hours=1):
         raise ValueError(
             "HRRR_FIT_TIME and HRRR_TEST_TIME must be exactly 1 hour apart."
         )
+    if HRRR_TEST_TIME_PLUS6 - HRRR_FIT_TIME != timedelta(hours=6):
+        raise ValueError(
+            "HRRR_TEST_TIME_PLUS6 must be exactly 6 hours after HRRR_FIT_TIME."
+        )
+    if HRRR_TEST_TIME_PLUS12 - HRRR_FIT_TIME != timedelta(hours=12):
+        raise ValueError(
+            "HRRR_TEST_TIME_PLUS12 must be exactly 12 hours after HRRR_FIT_TIME."
+        )
     fit_time = np.datetime64(HRRR_FIT_TIME)
-    test_time = np.datetime64(HRRR_TEST_TIME)
+    test_times = np.array(
+        [
+            np.datetime64(HRRR_TEST_TIME),
+            np.datetime64(HRRR_TEST_TIME_PLUS6),
+            np.datetime64(HRRR_TEST_TIME_PLUS12),
+        ]
+    )
     variables = ["u10m", "v10m"] + [
         f"{p}{k}hl"
         for p in ["Z", "u", "v"]
@@ -377,11 +405,22 @@ def run_hrrr_only() -> None:
         cal_u10 = calib_ds["u10m"].transpose(*calib_out_dims).values
         cal_v10 = calib_ds["v10m"].transpose(*calib_out_dims).values
 
-        # Test dataset: second fixed HRRR field exactly 1h later.
-        da = hrrr(np.array([test_time]), variables)
+        # Test dataset: fixed +1h, +6h, and +12h HRRR fields.
+        da = hrrr(test_times, variables)
         ds = da.to_dataset(dim="variable")
         if "lead_time" not in ds.coords:
             ds = ds.expand_dims({"lead_time": np.array([np.timedelta64(0, "h")])})
+        # Recast HRRR analysis times into pseudo lead times from fit init so
+        # per-lead diagnostics report +1h/+6h/+12h instead of only lead=0.
+        if ds.sizes.get("lead_time", 1) == 1:
+            ds = ds.isel(lead_time=0, drop=True)
+        lead_offsets = ds["time"].values.astype("datetime64[ns]") - np.datetime64(
+            HRRR_FIT_TIME
+        ).astype("datetime64[ns]")
+        ds = ds.rename({"time": "lead_time"}).assign_coords(
+            lead_time=lead_offsets.astype("timedelta64[ns]")
+        )
+        ds = ds.expand_dims({"time": np.array([fit_time])})
         methods, out_dims, _ = _derive_methods(ds)
         X_test = build_wind_feature_tensor(ds, out_dims)
         X_cal = build_wind_feature_tensor(calib_ds, calib_out_dims)
