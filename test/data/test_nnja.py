@@ -57,11 +57,22 @@ def test_nnja_obs_conv_lexicon_modifiers():
     df = mod(pd.DataFrame({"observation": [1.0]}))
     assert df["observation"].iloc[0] == pytest.approx(100.0)
 
-    # u, v: identity
-    for var in ("u", "v"):
+    # u, v, gps, gps_t, gps_q: identity (already SI)
+    for var in ("u", "v", "gps", "gps_t", "gps_q"):
         _, mod = NNJAObsConvLexicon[var]
         df = mod(pd.DataFrame({"observation": [3.14]}))
         assert df["observation"].iloc[0] == pytest.approx(3.14)
+
+
+def test_nnja_obs_conv_lexicon_routes():
+    """Conv lexicon entries are route-prefixed with 'prepbufr::' or 'gpsro::'."""
+    for var, vocab in NNJAObsConvLexicon.VOCAB.items():
+        route, _, rest = vocab.partition("::")
+        assert route in ("prepbufr", "gpsro"), f"{var}: unexpected route '{route}'"
+        assert rest, f"{var}: empty payload after route prefix"
+        if route == "gpsro":
+            # rest must parse as an int BUFR descriptor id
+            int(rest)
 
 
 def test_nnja_satellite_lexicon_parse():
@@ -120,7 +131,7 @@ def _bare_sat(satellites: list[str] | None = None) -> NNJAObsSat:
 
 def test_nnja_obs_conv_build_uri():
     obj = _bare_conv("prepbufr")
-    uri = obj._build_uri(datetime(2024, 1, 1, 0))
+    uri = obj._build_prepbufr_uri(datetime(2024, 1, 1, 0))
     assert uri == (
         "s3://noaa-reanalyses-pds/observations/reanalysis/conv/prepbufr/"
         "2024/01/prepbufr/gdas.20240101.t00z.prepbufr.nr"
@@ -129,7 +140,19 @@ def test_nnja_obs_conv_build_uri():
     obj2 = _bare_conv("convbufr")
     assert (
         "convbufr/2024/01/convbufr/gdas.20240101.t00z.convbufr.nr"
-        in obj2._build_uri(datetime(2024, 1, 1, 0))
+        in obj2._build_prepbufr_uri(datetime(2024, 1, 1, 0))
+    )
+
+    # Back-compat alias still works
+    assert obj._build_uri(datetime(2024, 1, 1, 0)) == uri
+
+
+def test_nnja_obs_conv_build_gpsro_uri():
+    obj = _bare_conv("prepbufr")
+    uri = obj._build_gpsro_uri(datetime(2024, 1, 1, 6))
+    assert uri == (
+        "s3://noaa-reanalyses-pds/observations/reanalysis/gps/gpsro/"
+        "2024/01/bufr/gdas.20240101.t06z.gpsro.tm00.bufr_d"
     )
 
 
@@ -149,9 +172,12 @@ def test_nnja_obs_sat_build_uri():
 
 
 def test_nnja_obs_conv_create_tasks_dedupes_and_aligns():
+    from earth2studio.data.nnja import _NNJAConvTask
+
     obj = _bare_conv()
     tasks = obj._create_tasks([datetime(2024, 1, 1, 0)], ["t"])
     assert len(tasks) == 1
+    assert isinstance(tasks[0], _NNJAConvTask)
     assert tasks[0].datetime_file == datetime(2024, 1, 1, 0)
     assert "t" in tasks[0].var_plan
 
@@ -160,8 +186,33 @@ def test_nnja_obs_conv_create_tasks_dedupes_and_aligns():
     obj._tolerance_upper = timedelta(hours=3)
     tasks = obj._create_tasks([datetime(2024, 1, 1, 0)], ["t", "u"])
     cycle_hours = sorted({t.datetime_file.hour for t in tasks})
-    # window [21z prev day, 03z] hits 18z, 00z (ceil to 6h grid)
     assert 0 in cycle_hours
+
+
+def test_nnja_obs_conv_create_tasks_routes_gpsro_separately():
+    """Requesting prepbufr + gpsro variables creates two task types per cycle."""
+    from earth2studio.data.nnja import _NNJAConvTask, _NNJAGpsRoTask
+
+    obj = _bare_conv()
+    tasks = obj._create_tasks([datetime(2024, 1, 1, 0)], ["t", "gps_t", "gps_q"])
+    types = {type(task).__name__ for task in tasks}
+    assert {"_NNJAConvTask", "_NNJAGpsRoTask"} == types
+
+    conv_tasks = [t for t in tasks if isinstance(t, _NNJAConvTask)]
+    gps_tasks = [t for t in tasks if isinstance(t, _NNJAGpsRoTask)]
+    assert len(conv_tasks) == 1
+    assert len(gps_tasks) == 1
+    assert "t" in conv_tasks[0].var_plan
+    assert "gps_t" in gps_tasks[0].var_plan
+    assert "gps_q" in gps_tasks[0].var_plan
+    # The gpsro var_plan stores (descriptor_id, modifier)
+    desc_id, _ = gps_tasks[0].var_plan["gps_t"]
+    assert desc_id == 12001
+    desc_id, _ = gps_tasks[0].var_plan["gps_q"]
+    assert desc_id == 13001
+    # Verify URIs
+    assert "/conv/prepbufr/" in conv_tasks[0].s3_uri
+    assert "/gps/gpsro/" in gps_tasks[0].s3_uri
 
 
 def test_nnja_obs_sat_create_tasks_filters_satellites():

@@ -23,14 +23,25 @@ from .base import LexiconType
 
 
 class NNJAObsConvLexicon(metaclass=LexiconType):
-    """NOAA-NASA Joint Archive (NNJA) PrepBUFR lexicon for conventional
-    (in-situ) observations.
+    """NOAA-NASA Joint Archive (NNJA) lexicon for conventional (in-situ
+    and GPS RO) observations.
 
-    Maps Earth2Studio variable names to PrepBUFR mnemonics in the NNJA
-    ``conv/prepbufr/`` archive. Vocab values are either a PrepBUFR
-    mnemonic (e.g. ``"TOB"`` for temperature) or ``"wind::u"`` /
-    ``"wind::v"`` for wind components decomposed from the UOB/VOB level
-    fields.
+    Maps Earth2Studio variable names to a route-prefixed source key.
+    The route prefix selects which NNJA archive folder (and decoder)
+    the data source uses:
+
+    - ``prepbufr::<mnemonic>`` -- read from ``conv/prepbufr/`` PrepBUFR
+      cycle files, decoded with pybufrkit using the NCEP-local DX tables
+      embedded in the file. Mnemonic is one of ``TOB``/``QOB``/``POB`` for
+      pressure/temperature/specific humidity, or ``wind::u``/``wind::v``
+      for wind components decomposed from UOB/VOB.
+    - ``gpsro::<descriptor_id>`` -- read from ``gps/gpsro/`` GPS RO
+      occultation BUFR cycle files. ``descriptor_id`` is the BUFR
+      descriptor of the per-level field to emit:
+
+      - ``15037`` -- bending angle (rad), at impact-parameter levels.
+      - ``12001`` -- 1D-Var retrieval temperature (K), at retrieval levels.
+      - ``13001`` -- 1D-Var retrieval specific humidity (kg/kg).
 
     Modifier functions convert raw PrepBUFR observation values to
     Earth2Studio standard units:
@@ -39,31 +50,37 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
     - ``q``: QOB (mg/kg) -> kg kg-1 (/1e6)
     - ``pres``: POB (hPa / MB) -> Pa (*100)
     - ``u``, ``v``: UOB/VOB already in m s-1 (no conversion)
+    - ``gps``, ``gps_t``, ``gps_q``: already in SI (rad, K, kg/kg)
 
     Note
     ----
     This lexicon parallels :py:class:`earth2studio.lexicon.GDASObsConvLexicon`
-    but is kept separate to keep the NNJA data source self-contained.
-    A future refactor may merge them into a shared PrepBUFR vocabulary.
+    (PrepBUFR variables) and :py:class:`earth2studio.lexicon.GSIConventionalLexicon`
+    (UFS GSI variables, including ``gps``/``gps_t``/``gps_q``) but is kept
+    separate to keep the NNJA data source self-contained.
 
-    Additional resources on PrepBUFR format and observation types:
+    Additional resources:
 
     - https://psl.noaa.gov/data/nnja_obs/
     - https://www.emc.ncep.noaa.gov/mmb/data_processing/prepbufr.doc/table_2.htm
-    - https://www.emc.ncep.noaa.gov/mmb/data_processing/prepbufr.doc/document.htm
+    - NCEP gpsro BUFR descriptor reference (BUFR Table B 0-15-037, 0-12-001, 0-13-001)
     """
 
     VOCAB: dict[str, str] = {
-        "u": "wind::u",
-        "v": "wind::v",
-        "q": "QOB",
-        "t": "TOB",
-        "pres": "POB",
+        "u": "prepbufr::wind::u",
+        "v": "prepbufr::wind::v",
+        "q": "prepbufr::QOB",
+        "t": "prepbufr::TOB",
+        "pres": "prepbufr::POB",
+        # GPS Radio Occultation, from gps/gpsro/ archive
+        "gps": "gpsro::15037",
+        "gps_t": "gpsro::12001",
+        "gps_q": "gpsro::13001",
     }
 
     @classmethod
     def get_item(cls, val: str) -> tuple[str, Callable[..., pd.DataFrame]]:
-        """Get item from PrepBUFR vocabulary.
+        """Get item from the NNJA conventional vocabulary.
 
         Parameters
         ----------
@@ -73,12 +90,12 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         Returns
         -------
         tuple[str, Callable]
-            - PrepBUFR vocab string (mnemonic or ``"wind::u"``/``"wind::v"``)
+            - Route-prefixed source key (``"prepbufr::..."`` or ``"gpsro::..."``).
             - A modifier function applied to the loaded DataFrame to convert
-              the ``observation`` column from raw PrepBUFR units to
-              Earth2Studio standard units.
+              the ``observation`` column from raw BUFR units to Earth2Studio
+              standard units.
         """
-        bufr_key = cls.VOCAB[val]
+        source_key = cls.VOCAB[val]
 
         if val == "t":
 
@@ -103,7 +120,7 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
             def mod(df: pd.DataFrame) -> pd.DataFrame:
                 return df
 
-        return bufr_key, mod
+        return source_key, mod
 
 
 class NNJASatelliteLexicon(metaclass=LexiconType):

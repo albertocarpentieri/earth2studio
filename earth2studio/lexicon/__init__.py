@@ -38,6 +38,7 @@ from .metop import (
 from .mrms import MRMSLexicon
 from .ncar import NCAR_ERA5Lexicon
 from .nclimgrid import NClimGridLexicon
+from .nnja import NNJAObsConvLexicon, NNJASatelliteLexicon
 from .planetary_computer import (
     PlanetaryComputerECMWFOpenDataIFSLexicon,
     PlanetaryComputerGOESLexicon,
