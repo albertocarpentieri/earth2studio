@@ -37,6 +37,7 @@ import pathlib
 import shutil
 import struct
 import sys
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
@@ -191,6 +192,99 @@ _GPSRO_SPFH = 13001  # Specific humidity (kg/kg)
 
 # Descriptor IDs the gpsro decoder pulls out as observations
 _GPSRO_OBS_DESCRS: set[int] = {_GPSRO_BNDA, _GPSRO_TEMP, _GPSRO_SPFH}
+
+
+# ── Satellite-radiance BUFR descriptor IDs (FXY as integers) ─────────
+# Used by the pybufrkit fallback decoder for sensors whose NCEP-local
+# template descriptors are missing from the eccodes BUFR tables (most
+# notably ``1bmhs`` / ``1bamua`` / ``1bamub`` / ``1bhrs3``). FXY codes
+# are encoded as ``F * 100000 + X * 1000 + Y`` to match how
+# ``pybufrkit`` exposes ``descriptor.id``.
+_SAT_FXY_LATITUDE: tuple[int, ...] = (5001, 5002)
+_SAT_FXY_LONGITUDE: tuple[int, ...] = (6001, 6002)
+_SAT_FXY_SATID: tuple[int, ...] = (1007,)
+_SAT_FXY_YEAR: tuple[int, ...] = (4001,)
+_SAT_FXY_MONTH: tuple[int, ...] = (4002,)
+_SAT_FXY_DAY: tuple[int, ...] = (4003,)
+_SAT_FXY_HOUR: tuple[int, ...] = (4004,)
+_SAT_FXY_MINUTE: tuple[int, ...] = (4005,)
+_SAT_FXY_SECOND: tuple[int, ...] = (4006,)
+_SAT_FXY_SOL_ZA: tuple[int, ...] = (7025,)
+_SAT_FXY_SOL_AZA: tuple[int, ...] = (5022,)
+_SAT_FXY_SAT_ZA: tuple[int, ...] = (7024,)
+_SAT_FXY_SAT_AZA: tuple[int, ...] = (5021,)
+_SAT_FXY_CHAN_NUM: tuple[int, ...] = (5042,)
+
+# Map eccodes BUFR-key strings (as used in NNJASatelliteLexicon) to
+# the candidate descriptor IDs the pybufrkit fallback should pull as
+# observation values.
+_SAT_BUFR_KEY_TO_FXY: dict[str, tuple[int, ...]] = {
+    "brightnessTemperature": (12063, 12163),
+    "radiance": (14043, 14044, 14045, 14046),
+    "scaledRadiance": (14043, 14044, 14045, 14046),
+    "scaledIasiRadiance": (14046,),
+}
+
+
+def _first_value(descs: list[Any], vals: list[Any], fxy_ids: tuple[int, ...]) -> Any:
+    """First non-``None`` value whose descriptor id matches ``fxy_ids``."""
+    for d, v in zip(descs, vals):
+        if getattr(d, "id", None) in fxy_ids and v is not None:
+            return v
+    return None
+
+
+def _all_values(
+    descs: list[Any], vals: list[Any], fxy_ids: tuple[int, ...]
+) -> list[Any]:
+    """All non-``None`` values whose descriptor id matches ``fxy_ids``."""
+    return [
+        v
+        for d, v in zip(descs, vals)
+        if getattr(d, "id", None) in fxy_ids and v is not None
+    ]
+
+
+def _paired_channel_obs(
+    descs: list[Any],
+    vals: list[Any],
+    obs_fxy: tuple[int, ...],
+    chan_fxy: tuple[int, ...],
+) -> tuple[list[int], list[float | None]]:
+    """Pair each ``channelNumber`` with the obs value that follows it.
+
+    Walks ``(descs, vals)`` in stream order and emits one ``(channel,
+    obs)`` pair for every obs descriptor whose id is in ``obs_fxy``,
+    using the most recent ``chan_fxy`` value as the channel number.
+    Pairs where the channel number is missing are dropped; obs values
+    that are missing are kept as ``None`` so the caller can place a
+    ``NaN`` in the right column of the output matrix.
+
+    This matches how NCEP-local satellite BUFR templates lay out
+    radiances (each scaled radiance descriptor is preceded in the
+    stream by its channel number), and works for both single-band
+    sensors (e.g. ``mhs``, ``atms``) and multi-band sensors that
+    interleave several obs FXYs (e.g. CrIS-FSR with 14043+14044) or
+    advertise more channels than they fill (e.g. IASI with 658
+    declared channels but ~616 non-missing radiances).
+    """
+    chans: list[int] = []
+    obs: list[float | None] = []
+    last_chan: int | None = None
+    for d, v in zip(descs, vals):
+        did = getattr(d, "id", None)
+        if did in chan_fxy:
+            if v is not None:
+                try:
+                    last_chan = int(v)
+                except (TypeError, ValueError):
+                    last_chan = None
+        elif did in obs_fxy:
+            if last_chan is None:
+                continue
+            chans.append(last_chan)
+            obs.append(None if v is None else float(v))
+    return chans, obs
 
 
 # ── WMO satellite identifier code (Table 0-01-007) → NNJA platform ──
@@ -498,20 +592,41 @@ class _NNJAObsBase:
     ) -> pd.DataFrame:
         """Decode each fetched file and concatenate into a single DataFrame."""
         frames: list[pd.DataFrame] = []
-        for task in async_tasks:
+        n_tasks = len(async_tasks)
+        compile_t0 = time.perf_counter()
+        for idx, task in enumerate(async_tasks, start=1):
             local_path = self._cache_path(task.s3_uri)
             if not pathlib.Path(local_path).is_file():
                 logger.warning(f"Cached file missing for {task.s3_uri}, skipping")
                 continue
+            short_uri = task.s3_uri.rsplit("/", 1)[-1]
+            logger.info(
+                f"[{self.SOURCE_ID}] decode {idx}/{n_tasks} start: {short_uri}"
+            )
+            t0 = time.perf_counter()
             try:
                 df = self._decode_file(local_path, task)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error(f"Failed to decode {local_path}: {exc}")
                 continue
+            elapsed = time.perf_counter() - t0
             if df is None or df.empty:
+                logger.info(
+                    f"[{self.SOURCE_ID}] decode {idx}/{n_tasks} done : "
+                    f"{short_uri} (empty) in {elapsed:.1f}s"
+                )
                 continue
+            logger.info(
+                f"[{self.SOURCE_ID}] decode {idx}/{n_tasks} done : "
+                f"{short_uri} ({len(df):,} rows) in {elapsed:.1f}s"
+            )
             df.attrs["source"] = self.SOURCE_ID
             frames.append(df)
+
+        logger.info(
+            f"[{self.SOURCE_ID}] compile finished: {len(frames)} non-empty "
+            f"frames, total {time.perf_counter() - compile_t0:.1f}s"
+        )
 
         if not frames:
             return pd.DataFrame(
@@ -529,6 +644,37 @@ class _NNJAObsBase:
 
     def _decode_file(self, local_path: str, task: Any) -> pd.DataFrame:
         raise NotImplementedError("Subclasses must implement _decode_file.")
+
+    # ------------------------------------------------------------------
+    # Cycle iteration shared by all NNJA subclasses
+    # ------------------------------------------------------------------
+    def _cycle_windows(
+        self, time_list: list[datetime]
+    ) -> dict[datetime, tuple[datetime, datetime]]:
+        """Map each unique 6-hour cycle to the union of requested time windows.
+
+        For each ``t`` in ``time_list`` we cover all 6-hour cycles
+        whose synoptic time falls within ``[t + tol_lower, t + tol_upper]``.
+        Multiple input times that map to the same cycle are merged by
+        taking the union of their windows so the cycle file is fetched
+        once but ``_extract_subset`` keeps observations valid for any
+        of them.
+        """
+        windows: dict[datetime, tuple[datetime, datetime]] = {}
+        for t in time_list:
+            tmin = t + self._tolerance_lower
+            tmax = t + self._tolerance_upper
+            day = tmin.replace(minute=0, second=0, microsecond=0)
+            day = day.replace(hour=(day.hour // 6) * 6)
+            while day <= tmax:
+                existing = windows.get(day)
+                windows[day] = (
+                    (min(existing[0], tmin), max(existing[1], tmax))
+                    if existing is not None
+                    else (tmin, tmax)
+                )
+                day += timedelta(hours=6)
+        return windows
 
     # ------------------------------------------------------------------
     # Time validation / cache / fields
@@ -789,18 +935,26 @@ def _extract_dx_tables(
 _worker_decoder: Any = None
 
 
+def _register_dx_tables(
+    table_b: dict[int, tuple[Any, ...]],
+    table_d: dict[int, tuple[Any, ...]],
+) -> None:
+    """Reset pybufrkit's table cache and (re-)register NCEP DX tables."""
+    TableGroupCacheManager.clear_extra_entries()
+    TableGroupCacheManager._TABLE_GROUP_CACHE.invalidate()
+    if table_b or table_d:
+        TableGroupCacheManager.add_extra_entries(table_b, table_d)
+
+
 def _init_worker(
     table_b: dict[int, tuple[Any, ...]],
     table_d: dict[int, tuple[Any, ...]],
 ) -> None:
-    """ProcessPoolExecutor initializer: register NCEP DX tables and
-    create a per-process pybufrkit decoder. Also redirect this
-    worker's stderr to /dev/null to silence the per-message
-    sub-centre warnings printed by pybufrkit."""
+    """ProcessPoolExecutor initializer: register NCEP DX tables, create a
+    per-process pybufrkit decoder, and redirect the worker's stderr to
+    /dev/null (the worker only decodes BUFR; real errors come back
+    through exceptions, not stderr)."""
     global _worker_decoder  # noqa: PLW0603
-    # Permanently redirect the worker's stderr; the worker only does
-    # BUFR decoding, so legitimate errors come back via exceptions /
-    # return values rather than stderr.
     try:
         sys.stderr.flush()
         devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -808,10 +962,7 @@ def _init_worker(
         os.close(devnull_fd)
     except OSError:
         pass
-    TableGroupCacheManager.clear_extra_entries()
-    TableGroupCacheManager._TABLE_GROUP_CACHE.invalidate()
-    if table_b or table_d:
-        TableGroupCacheManager.add_extra_entries(table_b, table_d)
+    _register_dx_tables(table_b, table_d)
     _worker_decoder = BufrDecoder()
 
 
@@ -822,8 +973,186 @@ def _decode_message_worker(
     dt_min: datetime,
     dt_max: datetime,
 ) -> list[dict[str, Any]]:
-    """Decode a single BUFR message in a worker process."""
+    """Decode a single PrepBUFR message in a worker process."""
     return _decode_message(_worker_decoder, msg_bytes, obs_class, var_keys, dt_min, dt_max)
+
+
+def _decode_gpsro_message_worker(
+    msg_bytes: bytes,
+    wanted_descrs: dict[int, str],
+    dt_min: datetime,
+    dt_max: datetime,
+) -> list[dict[str, Any]]:
+    """Decode a single GPS-RO BUFR message in a worker process.
+
+    Each NNJA gpsro message contains one occultation with several
+    hundred delayed-replication levels; pybufrkit's pure-Python
+    bitstream decoder is the bottleneck, so we parallelize across
+    messages with a ProcessPoolExecutor (same pattern as PrepBUFR).
+    """
+    try:
+        msg = _worker_decoder.process(msg_bytes)
+        n_subsets = msg.n_subsets.value
+    except Exception:
+        return []
+    if not n_subsets:
+        return []
+    td = msg.template_data.value
+    ddas = td.decoded_descriptors_all_subsets
+    dvas = td.decoded_values_all_subsets
+    rows: list[dict[str, Any]] = []
+    for s_idx in range(n_subsets):
+        rows.extend(
+            _extract_gpsro_subset(
+                ddas[s_idx], dvas[s_idx], wanted_descrs, dt_min, dt_max
+            )
+        )
+    return rows
+
+
+# Per-FOV scalar fields pulled out of pybufrkit-decoded satellite
+# messages by FXY descriptor id (module-level so a process-pool
+# worker can use them without pickling ``self``).
+_SAT_PYBUFRKIT_FLOAT_FIELDS: tuple[tuple[str, tuple[int, ...]], ...] = (
+    ("lat", _SAT_FXY_LATITUDE),
+    ("lon", _SAT_FXY_LONGITUDE),
+    ("solza", _SAT_FXY_SOL_ZA),
+    ("solaza", _SAT_FXY_SOL_AZA),
+    ("sat_za", _SAT_FXY_SAT_ZA),
+    ("sat_aza", _SAT_FXY_SAT_AZA),
+)
+_SAT_PYBUFRKIT_INT_FIELDS: tuple[tuple[str, tuple[int, ...]], ...] = (
+    ("years", _SAT_FXY_YEAR),
+    ("months", _SAT_FXY_MONTH),
+    ("days", _SAT_FXY_DAY),
+    ("hours", _SAT_FXY_HOUR),
+    ("minutes", _SAT_FXY_MINUTE),
+    ("seconds", _SAT_FXY_SECOND),
+)
+
+
+def _extract_satellite_pybufrkit(
+    msg: Any,
+    bufr_key: str,
+    cycle_year: int,
+    cycle_month: int,
+    cycle_day: int,
+    cycle_hour: int,
+) -> dict[str, Any] | None:
+    """Decode one satellite-radiance BUFR message via pybufrkit.
+
+    Returns the per-FOV arrays needed by ``_emit_satellite_rows`` or
+    ``None`` if the message has no observation values (e.g. a header
+    or DX-table message that slipped through). Works on plain
+    primitives so it can be called from a process-pool worker.
+    """
+    obs_fxy = _SAT_BUFR_KEY_TO_FXY.get(bufr_key)
+    if not obs_fxy:
+        return None
+    try:
+        n_subsets = msg.n_subsets.value
+        if not n_subsets:
+            return None
+        td = msg.template_data.value
+        ddas = td.decoded_descriptors_all_subsets
+        dvas = td.decoded_values_all_subsets
+    except Exception:
+        return None
+
+    n_fov = int(n_subsets)
+    floats: dict[str, np.ndarray] = {
+        name: np.full(n_fov, np.nan, dtype=np.float64)
+        for name, _ in _SAT_PYBUFRKIT_FLOAT_FIELDS
+    }
+    ints: dict[str, np.ndarray] = {
+        "years": np.full(n_fov, cycle_year, dtype=np.int64),
+        "months": np.full(n_fov, cycle_month, dtype=np.int64),
+        "days": np.full(n_fov, cycle_day, dtype=np.int64),
+        "hours": np.full(n_fov, cycle_hour, dtype=np.int64),
+        "minutes": np.zeros(n_fov, dtype=np.int64),
+        "seconds": np.zeros(n_fov, dtype=np.int64),
+    }
+    sat_id_per_fov: list[int | None] = [None] * n_fov
+    chan_arr: np.ndarray | None = None
+    n_channels = 0
+    obs = np.empty((0, 0), dtype=np.float64)
+    chan_to_col: dict[int, int] = {}
+
+    for s_idx in range(n_subsets):
+        descs = ddas[s_idx]
+        vals = dvas[s_idx]
+        for name, fxy in _SAT_PYBUFRKIT_FLOAT_FIELDS:
+            v = _first_value(descs, vals, fxy)
+            if v is not None:
+                floats[name][s_idx] = float(v)
+        for name, fxy in _SAT_PYBUFRKIT_INT_FIELDS:
+            v = _first_value(descs, vals, fxy)
+            if v is not None:
+                ints[name][s_idx] = int(v)
+        v = _first_value(descs, vals, _SAT_FXY_SATID)
+        if v is not None:
+            try:
+                sat_id_per_fov[s_idx] = int(v)
+            except (TypeError, ValueError):
+                pass
+
+        # Pair each channelNumber descriptor with the obs descriptor
+        # that follows it in the stream. This is the only stream-order
+        # interpretation that works across all NNJA satellite sensors:
+        # ``mhs``/``atms`` have one obs per channel; ``mtiasi`` has
+        # ~42 missing channels per FOV; ``crisf4`` has multiple obs
+        # FXYs (14043 / 14044) interleaved across bands. Counting
+        # channelNumber and obs descriptors independently (the old
+        # behaviour) silently drops entire subsets whenever the two
+        # counts differ.
+        sub_chans, sub_obs = _paired_channel_obs(descs, vals, obs_fxy, _SAT_FXY_CHAN_NUM)
+        if not sub_chans:
+            continue
+        if n_channels == 0:
+            chan_arr = np.array(sub_chans, dtype=np.uint16)
+            n_channels = chan_arr.size
+            chan_to_col = {int(c): i for i, c in enumerate(chan_arr)}
+            obs = np.full((n_fov, n_channels), np.nan, dtype=np.float64)
+        for c, ov in zip(sub_chans, sub_obs):
+            col = chan_to_col.get(c)
+            if col is None or ov is None:
+                continue
+            obs[s_idx, col] = ov
+
+    if chan_arr is None or n_channels == 0:
+        return None
+    if not np.isfinite(floats["lat"]).any() or not np.isfinite(floats["lon"]).any():
+        return None
+    valid_ids = [s for s in sat_id_per_fov if s is not None]
+    sat_id_arr = np.array(valid_ids, dtype=np.int64) if valid_ids else None
+
+    return {
+        "n_fov": n_fov,
+        "n_channels": n_channels,
+        "obs": obs,
+        "chan_arr": chan_arr,
+        "sat_id_arr": sat_id_arr,
+        **floats,
+        **ints,
+    }
+
+
+def _decode_sat_pybufrkit_worker(
+    msg_bytes: bytes,
+    bufr_key: str,
+    cycle_year: int,
+    cycle_month: int,
+    cycle_day: int,
+    cycle_hour: int,
+) -> dict[str, Any] | None:
+    """Decode a single satellite-radiance BUFR message in a worker process."""
+    try:
+        msg = _worker_decoder.process(msg_bytes)
+    except Exception:
+        return None
+    return _extract_satellite_pybufrkit(
+        msg, bufr_key, cycle_year, cycle_month, cycle_day, cycle_hour
+    )
 
 
 def _decode_message(
@@ -1319,52 +1648,34 @@ class NNJAObsConv(_NNJAObsBase):
                     f"'{source_key}' for variable '{v}' (expected 'prepbufr' or 'gpsro')"
                 )
 
+        # Build one task per unique cycle file; when multiple requested
+        # times map to the same cycle the task's window is the union of
+        # those time windows (see ``_NNJAObsBase._cycle_windows``).
+        windows = (
+            self._cycle_windows(time_list) if prepbufr_plan or gpsro_plan else {}
+        )
         tasks: list = []
-
-        if prepbufr_plan:
-            seen: set[str] = set()
-            for t in time_list:
-                tmin = t + self._tolerance_lower
-                tmax = t + self._tolerance_upper
-                day = tmin.replace(minute=0, second=0, microsecond=0)
-                day = day.replace(hour=(day.hour // 6) * 6)
-                while day <= tmax:
-                    uri = self._build_prepbufr_uri(day)
-                    if uri not in seen:
-                        tasks.append(
-                            _NNJAConvTask(
-                                s3_uri=uri,
-                                datetime_file=day,
-                                datetime_min=tmin,
-                                datetime_max=tmax,
-                                var_plan=prepbufr_plan,
-                            )
-                        )
-                        seen.add(uri)
-                    day = day + timedelta(hours=6)
-
-        if gpsro_plan:
-            seen = set()
-            for t in time_list:
-                tmin = t + self._tolerance_lower
-                tmax = t + self._tolerance_upper
-                day = tmin.replace(minute=0, second=0, microsecond=0)
-                day = day.replace(hour=(day.hour // 6) * 6)
-                while day <= tmax:
-                    uri = self._build_gpsro_uri(day)
-                    if uri not in seen:
-                        tasks.append(
-                            _NNJAGpsRoTask(
-                                s3_uri=uri,
-                                datetime_file=day,
-                                datetime_min=tmin,
-                                datetime_max=tmax,
-                                var_plan=gpsro_plan,
-                            )
-                        )
-                        seen.add(uri)
-                    day = day + timedelta(hours=6)
-
+        for cycle_dt, (tmin, tmax) in windows.items():
+            if prepbufr_plan:
+                tasks.append(
+                    _NNJAConvTask(
+                        s3_uri=self._build_prepbufr_uri(cycle_dt),
+                        datetime_file=cycle_dt,
+                        datetime_min=tmin,
+                        datetime_max=tmax,
+                        var_plan=prepbufr_plan,
+                    )
+                )
+            if gpsro_plan:
+                tasks.append(
+                    _NNJAGpsRoTask(
+                        s3_uri=self._build_gpsro_uri(cycle_dt),
+                        datetime_file=cycle_dt,
+                        datetime_min=tmin,
+                        datetime_max=tmax,
+                        var_plan=gpsro_plan,
+                    )
+                )
         return tasks
 
     def _build_prepbufr_uri(self, cycle: datetime) -> str:
@@ -1395,6 +1706,70 @@ class NNJAObsConv(_NNJAObsBase):
     def _build_uri(self, cycle: datetime) -> str:
         return self._build_prepbufr_uri(cycle)
 
+    # PyArrow-type → numpy/pandas dtype for the always-nullable
+    # numeric columns we add when a frame is missing them. Using a
+    # typed empty column (instead of object-dtype ``None``) keeps
+    # ``pd.concat`` from emitting "all-NA columns" FutureWarnings
+    # when frames from different sub-archives are concatenated.
+    _NULL_COLUMN_DTYPES: dict[str, type] = {
+        "pres": np.float32,
+        "elev": np.float32,
+        "station_elev": np.float32,
+        "lat": np.float32,
+        "lon": np.float32,
+        "observation": np.float32,
+    }
+
+    def _finalize_decoded_df(
+        self,
+        all_rows: list[dict[str, Any]],
+        var_plan: dict[str, tuple[Any, Callable[[pd.DataFrame], pd.DataFrame]]],
+        *,
+        convert_pres_mb_to_pa: bool,
+    ) -> pd.DataFrame:
+        """Apply per-variable modifiers, normalize dtypes, project to schema."""
+        if not all_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        result_frames: list[pd.DataFrame] = []
+        for var, (_key, modifier) in var_plan.items():
+            sub = df[df["variable"] == var]
+            if sub.empty:
+                continue
+            result_frames.append(modifier(sub.copy()))
+        if not result_frames:
+            return pd.DataFrame()
+        df = pd.concat(result_frames, ignore_index=True)
+
+        # PrepBUFR levels carry POB in mb; the schema-level pressure
+        # column should be in Pa for consistency with the lexicon's
+        # ``pres`` observation conversion.
+        if convert_pres_mb_to_pa and "pres" in df.columns:
+            df["pres"] = (df["pres"].astype(np.float32) * 100.0).astype(np.float32)
+
+        df["time"] = pd.to_datetime(df["time"])
+        for name in self.SCHEMA.names:
+            if name in df.columns:
+                continue
+            null_dtype = self._NULL_COLUMN_DTYPES.get(name)
+            if null_dtype is not None:
+                df[name] = np.full(len(df), np.nan, dtype=null_dtype)
+            else:
+                df[name] = pd.Series([None] * len(df), dtype=object)
+        return df[list(self.SCHEMA.names)]
+
+    def _handle_missing_file(self, path: str) -> None:
+        """Warn instead of raising on missing NNJA cycle files.
+
+        NNJA does not guarantee every cycle/sub-archive combination
+        exists (e.g. the ``gps/gpsro/`` archive only goes back to the
+        early 2000s, and individual cycles can be absent). Returning a
+        partial DataFrame is more useful than aborting a multi-cycle
+        request because of one missing file.
+        """
+        logger.warning(f"NNJA conventional file {path} not found, skipping")
+
     # ------------------------------------------------------------------
     # File decode (dispatch by task type)
     # ------------------------------------------------------------------
@@ -1402,6 +1777,11 @@ class NNJAObsConv(_NNJAObsBase):
         if isinstance(task, _NNJAGpsRoTask):
             return self._decode_gpsro_file(local_path, task)
         return self._decode_prepbufr_file(local_path, task)
+
+    # Threshold above which to spin up a multiprocess decoder. Pool
+    # startup costs a few hundred ms; for small files (and tests) we
+    # decode in-process.
+    _PREPBUFR_POOL_MIN_MESSAGES = 32
 
     def _decode_prepbufr_file(
         self, local_path: str, task: _NNJAConvTask
@@ -1421,11 +1801,21 @@ class NNJAObsConv(_NNJAObsBase):
             if data_cat in _PREPBUFR_OBS_TYPES
         ]
         if not work_items:
-            return pd.DataFrame(columns=self.SCHEMA.names)
+            return pd.DataFrame()
 
         all_rows: list[dict[str, Any]] = []
-
-        if self._max_workers > 1 and len(work_items) > 1:
+        use_pool = (
+            self._max_workers > 1
+            and len(work_items) >= self._PREPBUFR_POOL_MIN_MESSAGES
+        )
+        logger.info(
+            f"[NNJAObsConv prepbufr] cycle={task.datetime_file:%Y-%m-%d %H:%MZ} "
+            f"messages={len(work_items)} (parsed {len(messages)}, "
+            f"DX-table entries: B={len(table_b)} D={len(table_d)}) "
+            f"strategy={'pool' if use_pool else 'sequential'}"
+        )
+        decode_t0 = time.perf_counter()
+        if use_pool:
             with ProcessPoolExecutor(
                 max_workers=self._max_workers,
                 initializer=_init_worker,
@@ -1451,53 +1841,34 @@ class NNJAObsConv(_NNJAObsBase):
                         logger.debug("NNJA worker failed to decode a BUFR message")
         else:
             with _silence_bufr_noise():
-                TableGroupCacheManager.clear_extra_entries()
-                TableGroupCacheManager._TABLE_GROUP_CACHE.invalidate()
-                if table_b or table_d:
-                    TableGroupCacheManager.add_extra_entries(table_b, table_d)
+                _register_dx_tables(table_b, table_d)
                 decoder = BufrDecoder()
                 for msg_bytes, obs_class in work_items:
-                    rows = _decode_message(
-                        decoder,
-                        msg_bytes,
-                        obs_class,
-                        var_keys,
-                        task.datetime_min,
-                        task.datetime_max,
+                    all_rows.extend(
+                        _decode_message(
+                            decoder,
+                            msg_bytes,
+                            obs_class,
+                            var_keys,
+                            task.datetime_min,
+                            task.datetime_max,
+                        )
                     )
-                    all_rows.extend(rows)
 
-        if not all_rows:
-            return pd.DataFrame(columns=self.SCHEMA.names)
+        logger.info(
+            f"[NNJAObsConv prepbufr] cycle={task.datetime_file:%Y-%m-%d %H:%MZ} "
+            f"decoded {len(all_rows):,} raw rows in "
+            f"{time.perf_counter() - decode_t0:.1f}s"
+        )
+        return self._finalize_decoded_df(
+            all_rows, task.var_plan, convert_pres_mb_to_pa=True
+        )
 
-        df = pd.DataFrame(all_rows)
-        # Apply per-variable lexicon modifiers (unit conversions)
-        result_frames: list[pd.DataFrame] = []
-        for var, (_key, modifier) in task.var_plan.items():
-            sub = df[df["variable"] == var].copy()
-            if sub.empty:
-                continue
-            sub = modifier(sub)
-            result_frames.append(sub)
-        if not result_frames:
-            return pd.DataFrame(columns=self.SCHEMA.names)
-        df = pd.concat(result_frames, ignore_index=True)
-
-        # Convert pres column from MB to Pa (POB is in MB; the lexicon
-        # ``pres`` modifier already handles the observation column for
-        # the ``pres`` variable; the ``pres`` schema column is the
-        # level pressure shared across all variables and should also
-        # be in Pa).
-        if "pres" in df.columns:
-            df["pres"] = (df["pres"].astype(np.float32) * 100.0).astype(np.float32)
-
-        # Coerce column dtypes to schema
-        df["time"] = pd.to_datetime(df["time"])
-        for name in self.SCHEMA.names:
-            if name not in df.columns:
-                df[name] = None
-        df = df[list(self.SCHEMA.names)]
-        return df
+    # Threshold above which to spin up a multiprocess gpsro decoder.
+    # NNJA gpsro cycle files contain thousands of occultation messages,
+    # each with hundreds of delayed-replication levels — pybufrkit's
+    # pure-Python decoder is the bottleneck, so we parallelize.
+    _GPSRO_POOL_MIN_MESSAGES = 16
 
     def _decode_gpsro_file(
         self, local_path: str, task: _NNJAGpsRoTask
@@ -1505,85 +1876,93 @@ class NNJAObsConv(_NNJAObsBase):
         """Decode a single NNJA gps/gpsro cycle BUFR file into a DataFrame.
 
         The NNJA gpsro files use NCEP-local BUFR descriptors that the
-        standard ECMWF eccodes tables do not include.  We instead read
-        them with pybufrkit using the DX tables embedded at the start of
-        each file (same approach as the PrepBUFR decoder).  Each
-        occultation profile becomes one BUFR subset; we walk the
-        decoded descriptor list and emit one row per (occultation,
-        retrieval / impact-parameter level) for each requested variable.
+        standard ECMWF eccodes tables do not include, so we decode them
+        with pybufrkit using the DX tables embedded at the start of the
+        file. Each occultation profile is one message with several
+        hundred delayed-replication levels; we parallelize across
+        messages via ``ProcessPoolExecutor`` (same pattern as the
+        PrepBUFR decoder) since pybufrkit's pure-Python bitstream
+        reader is too slow for sequential decode.
         """
         with open(local_path, "rb") as fh:
             file_data = fh.read()
 
         table_b, table_d, messages = _parse_prepbufr_messages(file_data)
         if not messages:
-            return pd.DataFrame(columns=self.SCHEMA.names)
+            return pd.DataFrame()
 
         wanted_descrs: dict[int, str] = {
             desc_id: var for var, (desc_id, _mod) in task.var_plan.items()
         }
 
-        # pybufrkit's table cache is process-global; register the
-        # extracted DX tables and create a single decoder for sequential
-        # decode (gpsro files have far fewer messages than PrepBUFR so
-        # we skip the process pool here). The decode loop runs under
-        # the C-stderr silencer to suppress the per-message
-        # ``Cannot find sub-centre 3`` chatter from pybufrkit.
         all_rows: list[dict[str, Any]] = []
-        with _silence_bufr_noise():
-            TableGroupCacheManager.clear_extra_entries()
-            TableGroupCacheManager._TABLE_GROUP_CACHE.invalidate()
-            if table_b or table_d:
-                TableGroupCacheManager.add_extra_entries(table_b, table_d)
-            decoder = BufrDecoder()
-
-            for msg_bytes, _data_cat in messages:
-                try:
-                    msg = decoder.process(msg_bytes)
-                except Exception:  # noqa: S112
-                    continue
-                try:
-                    n_subsets = msg.n_subsets.value
-                except Exception:  # noqa: S112
-                    continue
-                if n_subsets == 0:
-                    continue
-                td = msg.template_data.value
-                ddas = td.decoded_descriptors_all_subsets
-                dvas = td.decoded_values_all_subsets
-                for s_idx in range(n_subsets):
-                    all_rows.extend(
-                        _extract_gpsro_subset(
-                            ddas[s_idx],
-                            dvas[s_idx],
-                            wanted_descrs,
-                            task.datetime_min,
-                            task.datetime_max,
-                        )
+        use_pool = (
+            self._max_workers > 1
+            and len(messages) >= self._GPSRO_POOL_MIN_MESSAGES
+        )
+        logger.info(
+            f"[NNJAObsConv gpsro]    cycle={task.datetime_file:%Y-%m-%d %H:%MZ} "
+            f"messages={len(messages)} "
+            f"strategy={'pool' if use_pool else 'sequential'}"
+        )
+        decode_t0 = time.perf_counter()
+        if use_pool:
+            with ProcessPoolExecutor(
+                max_workers=self._max_workers,
+                initializer=_init_worker,
+                initargs=(table_b, table_d),
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        _decode_gpsro_message_worker,
+                        msg_bytes,
+                        wanted_descrs,
+                        task.datetime_min,
+                        task.datetime_max,
                     )
+                    for msg_bytes, _data_cat in messages
+                ]
+                for future in futures:
+                    try:
+                        rows = future.result()
+                        if rows:
+                            all_rows.extend(rows)
+                    except Exception:
+                        logger.debug("NNJA worker failed to decode a gpsro message")
+        else:
+            with _silence_bufr_noise():
+                _register_dx_tables(table_b, table_d)
+                decoder = BufrDecoder()
+                for msg_bytes, _data_cat in messages:
+                    try:
+                        msg = decoder.process(msg_bytes)
+                        n_subsets = msg.n_subsets.value
+                    except Exception:  # noqa: S112
+                        continue
+                    if not n_subsets:
+                        continue
+                    td = msg.template_data.value
+                    ddas = td.decoded_descriptors_all_subsets
+                    dvas = td.decoded_values_all_subsets
+                    for s_idx in range(n_subsets):
+                        all_rows.extend(
+                            _extract_gpsro_subset(
+                                ddas[s_idx],
+                                dvas[s_idx],
+                                wanted_descrs,
+                                task.datetime_min,
+                                task.datetime_max,
+                            )
+                        )
 
-        if not all_rows:
-            return pd.DataFrame(columns=self.SCHEMA.names)
-
-        df = pd.DataFrame(all_rows)
-        # Apply per-variable lexicon modifiers
-        result_frames: list[pd.DataFrame] = []
-        for var, (_desc_id, modifier) in task.var_plan.items():
-            sub = df[df["variable"] == var].copy()
-            if sub.empty:
-                continue
-            sub = modifier(sub)
-            result_frames.append(sub)
-        if not result_frames:
-            return pd.DataFrame(columns=self.SCHEMA.names)
-        df = pd.concat(result_frames, ignore_index=True)
-
-        df["time"] = pd.to_datetime(df["time"])
-        for name in self.SCHEMA.names:
-            if name not in df.columns:
-                df[name] = None
-        df = df[list(self.SCHEMA.names)]
-        return df
+        logger.info(
+            f"[NNJAObsConv gpsro]    cycle={task.datetime_file:%Y-%m-%d %H:%MZ} "
+            f"decoded {len(all_rows):,} raw rows in "
+            f"{time.perf_counter() - decode_t0:.1f}s"
+        )
+        return self._finalize_decoded_df(
+            all_rows, task.var_plan, convert_pres_mb_to_pa=False
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1608,6 +1987,15 @@ class NNJAObsSat(_NNJAObsBase):
         ``["n20"]``). ``None`` (default) keeps all platforms carried by
         the requested sensor's source folder, as listed in
         :py:class:`earth2studio.lexicon.NNJASatelliteLexicon`.
+    channels : list[int] | None, optional
+        Restrict output to a subset of sensor channels (1-based indices
+        into the BUFR ``channelNumber``). ``None`` (default) keeps all
+        channels carried by the sensor. Strongly recommended for
+        hyperspectral sensors (IASI ~616 channels, CrIS-FSR ~545
+        channels) since the full ``(FOV, channel)`` cross-product is
+        easily multi-billion-row for a single 6-hour cycle. The filter
+        is applied before any DataFrame is materialised so it bounds
+        memory at decode time, not just after the fetch.
     time_tolerance : TimeTolerance, optional
         Time tolerance window for filtering observations, by default
         ``np.timedelta64(0, 'm')``.
@@ -1663,6 +2051,7 @@ class NNJAObsSat(_NNJAObsBase):
     def __init__(
         self,
         satellites: list[str] | None = None,
+        channels: list[int] | None = None,
         time_tolerance: TimeTolerance = np.timedelta64(0, "m"),
         max_workers: int = 24,
         cache: bool = True,
@@ -1678,6 +2067,23 @@ class NNJAObsSat(_NNJAObsBase):
                     f"Valid platforms across NNJASatelliteLexicon: {sorted(valid_platforms)}"
                 )
         self._satellites = satellites
+        if channels is not None:
+            try:
+                channels = [int(c) for c in channels]
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "channels must be an iterable of integers"
+                ) from exc
+            if any(c < 1 for c in channels):
+                raise ValueError(
+                    f"Invalid channels {sorted(set(c for c in channels if c < 1))}: "
+                    "channel indices are 1-based"
+                )
+            self._channels: np.ndarray | None = np.asarray(
+                sorted(set(channels)), dtype=np.uint16
+            )
+        else:
+            self._channels = None
         super().__init__(
             time_tolerance=time_tolerance,
             max_workers=max_workers,
@@ -1692,9 +2098,8 @@ class NNJAObsSat(_NNJAObsBase):
     def _create_tasks(
         self, time_list: list[datetime], variable: list[str]
     ) -> list[_NNJASatTask]:
+        windows = self._cycle_windows(time_list)
         tasks: list[_NNJASatTask] = []
-        seen_uris: set[str] = set()
-
         for v in variable:
             try:
                 key, modifier = NNJASatelliteLexicon[v]  # type: ignore[misc]
@@ -1710,17 +2115,11 @@ class NNJAObsSat(_NNJAObsBase):
                         f"No requested satellites available for {v}; skipping"
                     )
                     continue
-
-            for t in time_list:
-                tmin = t + self._tolerance_lower
-                tmax = t + self._tolerance_upper
-                day = tmin.replace(minute=0, second=0, microsecond=0)
-                day = day.replace(hour=(day.hour // 6) * 6)
-                while day <= tmax:
-                    uri = self._build_uri(day, sensor, source)
-                    task = _NNJASatTask(
-                        s3_uri=uri,
-                        datetime_file=day,
+            for cycle_dt, (tmin, tmax) in windows.items():
+                tasks.append(
+                    _NNJASatTask(
+                        s3_uri=self._build_uri(cycle_dt, sensor, source),
+                        datetime_file=cycle_dt,
                         datetime_min=tmin,
                         datetime_max=tmax,
                         sensor=sensor,
@@ -1730,12 +2129,7 @@ class NNJAObsSat(_NNJAObsBase):
                         e2s_obs_name=v,
                         modifier=modifier,
                     )
-                    # NB: same URI may legitimately recur if the user
-                    # requests overlapping times — keep the per-task
-                    # state, dedupe only on download level.
-                    tasks.append(task)
-                    seen_uris.add(uri)
-                    day = day + timedelta(hours=6)
+                )
         return tasks
 
     def _build_uri(self, cycle: datetime, sensor: str, source: str) -> str:
@@ -1758,162 +2152,374 @@ class NNJAObsSat(_NNJAObsBase):
     # ------------------------------------------------------------------
     # File decode
     # ------------------------------------------------------------------
+    # Threshold above which pybufrkit-fallback messages are decoded in
+    # a process pool. Sensors whose NCEP-local Table-D sequences are
+    # missing from eccodes (``1bamua``/``1bmhs``/``mtiasi``/``crisf4``)
+    # send all messages through pybufrkit and benefit massively.
+    _SAT_PYBUFRKIT_POOL_MIN_MESSAGES = 16
+
     def _decode_file(self, local_path: str, task: _NNJASatTask) -> pd.DataFrame:
         """Decode a satellite-radiance BUFR file into a DataFrame.
 
-        We iterate every BUFR message in the file with eccodes, request
-        the canonical observation arrays (lat/lon/angles/time) and the
-        sensor-specific radiance key from the lexicon, then emit one
-        row per (FOV, channel) tuple.
+        Each message yields one row per (FOV, channel) tuple. We try
+        eccodes first per message because it is significantly faster
+        than pybufrkit, but many NNJA sources (notably ``1bmhs`` /
+        ``1bamua`` / ``1bamub`` / ``1bhrs3``) reference NCEP-local
+        Table-D sequences that eccodes does not ship tables for. For
+        those, ``codes_set(msgid, "unpack", 1)`` raises
+        ``HashArrayNoMatchError(-37)`` and we fall back to pybufrkit.
+        Messages routed to pybufrkit are decoded in a process pool so
+        the pure-Python bitstream reader can run across all cores
+        (mirrors the PrepBUFR / GPS-RO pattern).
         """
-        rows: list[dict[str, Any]] = []
-        # The whole eccodes loop runs under the C-stderr silencer:
-        # NNJA satellite BUFR uses NCEP-local descriptors that
-        # eccodes does not ship tables for, so each call would
-        # otherwise emit ``ECCODES ERROR : unable to get
-        # descriptor`` lines straight to fd-2. We still detect
-        # decode failures via the Python exceptions raised by
-        # ``codes_set`` and ``codes_get*``.
-        with _silence_bufr_noise(), open(local_path, "rb") as fh:
-            while True:
-                msgid = eccodes.codes_bufr_new_from_file(fh)
-                if msgid is None:
-                    break
-                try:
-                    try:
-                        eccodes.codes_set(msgid, "unpack", 1)
-                    except Exception:  # noqa: S112
-                        continue
+        with open(local_path, "rb") as fh:
+            file_data = fh.read()
+        # ``_parse_prepbufr_messages`` works for any NCEP BUFR file:
+        # DX-table messages (dataCategory=11) are extracted and the
+        # rest are returned as raw message bytes ready to feed to
+        # either eccodes or pybufrkit.
+        table_b, table_d, messages = _parse_prepbufr_messages(file_data)
+        if not messages:
+            return pd.DataFrame()
 
-                    n_subsets = self._safe_get(msgid, "numberOfSubsets", default=0)
-                    if not n_subsets:
-                        continue
+        frames: list[pd.DataFrame] = []
+        n_eccodes_ok = n_pybufrkit_ok = 0
+        # Indices of messages that need the pybufrkit fallback path.
+        pybufrkit_indices: list[int] = []
+        pybufrkit_msg_bytes: list[bytes] = []
 
-                    lat = self._safe_get_array(msgid, "latitude")
-                    lon = self._safe_get_array(msgid, "longitude")
-                    if lat is None or lon is None or lat.size == 0:
-                        continue
+        logger.info(
+            f"[NNJAObsSat {task.sensor}/{task.source}] "
+            f"cycle={task.datetime_file:%Y-%m-%d %H:%MZ} "
+            f"messages={len(messages)} starting eccodes pass"
+        )
 
-                    obs_flat = self._safe_get_array(msgid, task.bufr_key)
-                    if obs_flat is None or obs_flat.size == 0:
-                        continue
+        # First pass — eccodes only. Fast (C extension) and almost
+        # always succeeds on ATMS/CrIS/SAPHIR/AIRS/etc.
+        ec_t0 = time.perf_counter()
+        with _silence_bufr_noise():
+            for idx, (msg_bytes, _data_cat) in enumerate(messages):
+                decoded = self._extract_eccodes_message(msg_bytes, task)
+                if decoded is not None:
+                    n_eccodes_ok += 1
+                    frame = self._emit_satellite_rows(decoded, task)
+                    if not frame.empty:
+                        frames.append(frame)
+                else:
+                    pybufrkit_indices.append(idx)
+                    pybufrkit_msg_bytes.append(msg_bytes)
+        logger.info(
+            f"[NNJAObsSat {task.sensor}/{task.source}] "
+            f"eccodes pass done: ok={n_eccodes_ok}/{len(messages)} "
+            f"fallback={len(pybufrkit_msg_bytes)} in {time.perf_counter() - ec_t0:.1f}s"
+        )
 
-                    n_fov = lat.size
-                    if obs_flat.size % n_fov != 0:
-                        logger.debug(
-                            f"Unexpected obs-array size {obs_flat.size} for "
-                            f"{n_fov} FOVs in {local_path}; skipping message"
+        # Second pass — pybufrkit fallback for messages eccodes rejected.
+        if pybufrkit_msg_bytes:
+            cycle = task.datetime_file
+            cycle_args = (cycle.year, cycle.month, cycle.day, cycle.hour)
+            use_pool = (
+                self._max_workers > 1
+                and len(pybufrkit_msg_bytes)
+                >= self._SAT_PYBUFRKIT_POOL_MIN_MESSAGES
+                and BufrDecoder is not None
+                and TableGroupCacheManager is not None
+            )
+            logger.info(
+                f"[NNJAObsSat {task.sensor}/{task.source}] "
+                f"pybufrkit pass: {len(pybufrkit_msg_bytes)} messages "
+                f"strategy={'pool' if use_pool else 'sequential'}"
+            )
+            pyb_t0 = time.perf_counter()
+            if use_pool:
+                with ProcessPoolExecutor(
+                    max_workers=self._max_workers,
+                    initializer=_init_worker,
+                    initargs=(table_b, table_d),
+                ) as pool:
+                    futures = [
+                        pool.submit(
+                            _decode_sat_pybufrkit_worker,
+                            mb,
+                            task.bufr_key,
+                            *cycle_args,
                         )
-                        continue
-                    n_channels = obs_flat.size // n_fov
-                    obs = obs_flat.reshape(n_channels, n_fov).T  # (n_fov, n_channels)
-
-                    solza = self._safe_get_array(msgid, "solarZenithAngle", n_fov)
-                    solaza = self._safe_get_array(msgid, "solarAzimuth", n_fov)
-                    sat_za = self._safe_get_array(msgid, "satelliteZenithAngle", n_fov)
-                    sat_aza = self._safe_get_array(msgid, "bearingOrAzimuth", n_fov)
-
-                    # Channel index — array of length n_channels if present
-                    chan_arr = self._safe_get_array(msgid, "channelNumber")
-                    if chan_arr is None or chan_arr.size != n_channels:
-                        chan_arr = np.arange(1, n_channels + 1, dtype=np.uint16)
-
-                    # Satellite identifier (scalar or per-FOV)
-                    sat_id_arr = self._safe_get_array(msgid, "satelliteIdentifier")
-                    if sat_id_arr is None or sat_id_arr.size == 0:
-                        sat_name = task.platforms[0] if task.platforms else ""
-                    elif sat_id_arr.size == 1:
-                        sat_name = _SAT_ID_MAP.get(
-                            int(sat_id_arr[0]),
-                            task.platforms[0] if task.platforms else "",
-                        )
-                    else:
-                        # Fall back: use first id
-                        sat_name = _SAT_ID_MAP.get(
-                            int(sat_id_arr[0]),
-                            task.platforms[0] if task.platforms else "",
-                        )
-
-                    # Filter by requested satellites
-                    if (
-                        self._satellites is not None
-                        and sat_name
-                        and sat_name not in self._satellites
-                    ):
-                        continue
-
-                    # Time fields (broadcast scalars)
-                    years = self._safe_get_time_array(msgid, "year", n_fov, default=task.datetime_file.year)
-                    months = self._safe_get_time_array(msgid, "month", n_fov, default=task.datetime_file.month)
-                    days = self._safe_get_time_array(msgid, "day", n_fov, default=task.datetime_file.day)
-                    hours = self._safe_get_time_array(msgid, "hour", n_fov, default=task.datetime_file.hour)
-                    minutes = self._safe_get_time_array(msgid, "minute", n_fov, default=0)
-                    seconds = self._safe_get_time_array(msgid, "second", n_fov, default=0)
-
-                    for i in range(n_fov):
+                        for mb in pybufrkit_msg_bytes
+                    ]
+                    for future in futures:
                         try:
-                            obs_time = datetime(
-                                int(years[i]),
-                                int(months[i]),
-                                int(days[i]),
-                                int(hours[i]),
-                                int(minutes[i]),
-                                int(seconds[i]),
+                            decoded = future.result()
+                        except Exception:
+                            continue
+                        if decoded is None:
+                            continue
+                        n_pybufrkit_ok += 1
+                        frame = self._emit_satellite_rows(decoded, task)
+                        if not frame.empty:
+                            frames.append(frame)
+            else:
+                with _silence_bufr_noise():
+                    if BufrDecoder is None or TableGroupCacheManager is None:
+                        decoder = None
+                    else:
+                        try:
+                            _register_dx_tables(table_b, table_d)
+                            decoder = BufrDecoder()
+                        except Exception as e:
+                            logger.debug(
+                                f"NNJA satellite: pybufrkit fallback init failed: {e!r}"
                             )
-                        except (ValueError, OverflowError):
-                            continue
-                        if (
-                            obs_time < task.datetime_min
-                            or obs_time > task.datetime_max
-                        ):
-                            continue
-                        for ch in range(n_channels):
-                            raw = float(obs[i, ch])
-                            if not np.isfinite(raw) or raw > 1e8:
+                            decoder = None
+                    if decoder is not None:
+                        for mb in pybufrkit_msg_bytes:
+                            try:
+                                msg = decoder.process(mb)
+                            except Exception:  # noqa: S112
                                 continue
-                            rows.append(
-                                {
-                                    "time": obs_time,
-                                    "lat": float(lat[i]),
-                                    "lon": float(lon[i]) % 360.0,
-                                    "scan_angle": None,
-                                    "channel_index": int(chan_arr[ch]),
-                                    "solza": float(solza[i]) if solza is not None else None,
-                                    "solaza": float(solaza[i]) if solaza is not None else None,
-                                    "satellite_za": float(sat_za[i]) if sat_za is not None else None,
-                                    "satellite_aza": float(sat_aza[i]) if sat_aza is not None else None,
-                                    "satellite": sat_name,
-                                    "observation": raw,
-                                    "variable": task.e2s_obs_name,
-                                }
-                            )
-                finally:
-                    eccodes.codes_release(msgid)
+                            decoded = self._extract_pybufrkit_message(msg, task)
+                            if decoded is None:
+                                continue
+                            n_pybufrkit_ok += 1
+                            frame = self._emit_satellite_rows(decoded, task)
+                            if not frame.empty:
+                                frames.append(frame)
 
-        if not rows:
-            return pd.DataFrame(columns=self.SCHEMA.names)
+        if pybufrkit_msg_bytes:
+            logger.info(
+                f"[NNJAObsSat {task.sensor}/{task.source}] "
+                f"pybufrkit pass done: ok={n_pybufrkit_ok}/{len(pybufrkit_msg_bytes)} "
+                f"in {time.perf_counter() - pyb_t0:.1f}s"
+            )
 
-        df = pd.DataFrame(rows)
-        df = task.modifier(df)
+        if not frames:
+            return pd.DataFrame()
 
-        # Coerce dtypes
+        df = task.modifier(pd.concat(frames, ignore_index=True))
         df["time"] = pd.to_datetime(df["time"])
-        for col, dtype in (
-            ("lat", np.float32),
-            ("lon", np.float32),
-            ("scan_angle", np.float32),
-            ("solza", np.float32),
-            ("solaza", np.float32),
-            ("satellite_za", np.float32),
-            ("satellite_aza", np.float32),
-            ("observation", np.float32),
+        for col in (
+            "lat",
+            "lon",
+            "scan_angle",
+            "solza",
+            "solaza",
+            "satellite_za",
+            "satellite_aza",
+            "observation",
         ):
             if col in df.columns and df[col].notna().any():
-                df[col] = df[col].astype(dtype)
+                df[col] = df[col].astype(np.float32)
         if "channel_index" in df.columns:
             df["channel_index"] = df["channel_index"].astype(np.uint16)
-        df = df[list(self.SCHEMA.names)]
-        return df
+        return df[list(self.SCHEMA.names)]
+
+    # ------------------------------------------------------------------
+    # Per-message extraction (eccodes primary, pybufrkit fallback)
+    # ------------------------------------------------------------------
+    def _extract_eccodes_message(
+        self, msg_bytes: bytes, task: _NNJASatTask
+    ) -> dict[str, Any] | None:
+        """Decode one BUFR message with eccodes.
+
+        Returns the per-FOV arrays needed by ``_emit_satellite_rows``
+        or ``None`` if eccodes cannot decode this message (typical
+        cause: NCEP-local Table-D sequence missing from eccodes' on-
+        disk tables, surfacing as ``HashArrayNoMatchError(-37)``).
+        """
+        try:
+            msgid = eccodes.codes_new_from_message(msg_bytes)
+        except Exception:
+            return None
+        if msgid is None:
+            return None
+        try:
+            try:
+                eccodes.codes_set(msgid, "unpack", 1)
+            except Exception:
+                return None
+
+            n_subsets = self._safe_get(msgid, "numberOfSubsets", default=0)
+            if not n_subsets:
+                return None
+
+            lat = self._safe_get_array(msgid, "latitude")
+            lon = self._safe_get_array(msgid, "longitude")
+            if lat is None or lon is None or lat.size == 0:
+                return None
+
+            obs_flat = self._safe_get_array(msgid, task.bufr_key)
+            if obs_flat is None or obs_flat.size == 0:
+                return None
+
+            n_fov = int(n_subsets) if n_subsets else int(lat.size)
+            if n_fov <= 0:
+                return None
+
+            if lat.size == 1 and n_fov > 1:
+                lat = np.full(n_fov, lat[0])
+            if lon.size == 1 and n_fov > 1:
+                lon = np.full(n_fov, lon[0])
+            if lat.size != n_fov or lon.size != n_fov:
+                return None
+            if obs_flat.size % n_fov != 0:
+                return None
+            n_channels = obs_flat.size // n_fov
+            obs = obs_flat.reshape(n_fov, n_channels)
+
+            solza = self._safe_get_array(msgid, "solarZenithAngle", n_fov)
+            solaza = self._safe_get_array(msgid, "solarAzimuth", n_fov)
+            sat_za = self._safe_get_array(msgid, "satelliteZenithAngle", n_fov)
+            sat_aza = self._safe_get_array(msgid, "bearingOrAzimuth", n_fov)
+
+            chan_arr = self._safe_get_array(msgid, "channelNumber")
+            if chan_arr is not None and chan_arr.size == n_fov * n_channels:
+                chan_arr = chan_arr[:n_channels]
+            elif chan_arr is None or chan_arr.size != n_channels:
+                chan_arr = np.arange(1, n_channels + 1, dtype=np.uint16)
+
+            sat_id_arr = self._safe_get_array(msgid, "satelliteIdentifier")
+
+            years = self._safe_get_time_array(
+                msgid, "year", n_fov, default=task.datetime_file.year
+            )
+            months = self._safe_get_time_array(
+                msgid, "month", n_fov, default=task.datetime_file.month
+            )
+            days = self._safe_get_time_array(
+                msgid, "day", n_fov, default=task.datetime_file.day
+            )
+            hours = self._safe_get_time_array(
+                msgid, "hour", n_fov, default=task.datetime_file.hour
+            )
+            minutes = self._safe_get_time_array(msgid, "minute", n_fov, default=0)
+            seconds = self._safe_get_time_array(msgid, "second", n_fov, default=0)
+
+            return {
+                "n_fov": n_fov,
+                "n_channels": n_channels,
+                "lat": np.asarray(lat, dtype=np.float64),
+                "lon": np.asarray(lon, dtype=np.float64),
+                "obs": np.asarray(obs, dtype=np.float64),
+                "solza": solza,
+                "solaza": solaza,
+                "sat_za": sat_za,
+                "sat_aza": sat_aza,
+                "chan_arr": np.asarray(chan_arr, dtype=np.uint16),
+                "sat_id_arr": sat_id_arr,
+                "years": years,
+                "months": months,
+                "days": days,
+                "hours": hours,
+                "minutes": minutes,
+                "seconds": seconds,
+            }
+        finally:
+            try:
+                eccodes.codes_release(msgid)
+            except Exception:
+                pass
+
+    def _extract_pybufrkit_message(
+        self, msg: Any, task: _NNJASatTask
+    ) -> dict[str, Any] | None:
+        """Decode one BUFR message via the pybufrkit fallback (in-process)."""
+        cycle = task.datetime_file
+        return _extract_satellite_pybufrkit(
+            msg, task.bufr_key, cycle.year, cycle.month, cycle.day, cycle.hour
+        )
+
+    def _emit_satellite_rows(
+        self, decoded: dict[str, Any], task: _NNJASatTask
+    ) -> pd.DataFrame:
+        """Build a per-(FOV, channel) DataFrame from a decoded message."""
+        n_fov = int(decoded["n_fov"])
+        n_channels = int(decoded["n_channels"])
+        lat = decoded["lat"]
+        lon = decoded["lon"]
+        obs = decoded["obs"]
+        chan_arr = decoded["chan_arr"]
+        sat_id_arr = decoded["sat_id_arr"]
+
+        # Satellite name (one per message — NCEP files are typically
+        # platform-homogeneous; if not, fall back to the first id).
+        default_name = task.platforms[0] if task.platforms else ""
+        if sat_id_arr is None or sat_id_arr.size == 0:
+            sat_name = default_name
+        else:
+            sat_name = _SAT_ID_MAP.get(int(sat_id_arr[0]), default_name)
+        if (
+            self._satellites is not None
+            and sat_name
+            and sat_name not in self._satellites
+        ):
+            return pd.DataFrame()
+
+        # Vectorized FOV-level filter: valid time, in window, finite (lat, lon).
+        time_df = pd.DataFrame(
+            {
+                "year": decoded["years"],
+                "month": decoded["months"],
+                "day": decoded["days"],
+                "hour": decoded["hours"],
+                "minute": decoded["minutes"],
+                "second": decoded["seconds"],
+            }
+        )
+        obs_time = pd.to_datetime(time_df, errors="coerce")
+        in_window = (
+            (obs_time >= pd.Timestamp(task.datetime_min))
+            & (obs_time <= pd.Timestamp(task.datetime_max))
+        ).fillna(False).to_numpy()
+        fov_ok = in_window & np.isfinite(lat) & np.isfinite(lon)
+        if not fov_ok.any():
+            return pd.DataFrame()
+
+        # Build the (FOV, channel) cross-product, masking invalid obs.
+        # When the user passed ``channels=[...]`` we restrict the cross-
+        # product up front: this is critical for hyperspectral sensors
+        # (IASI / CrIS-FSR) where the unrestricted product is hundreds
+        # of millions of rows per cycle file.
+        if self._channels is not None:
+            chan_keep = np.isin(chan_arr, self._channels)
+            if not chan_keep.any():
+                return pd.DataFrame()
+            chan_cols = np.flatnonzero(chan_keep)
+            n_channels = chan_cols.size
+            obs = obs[:, chan_cols]
+            chan_arr = chan_arr[chan_cols]
+        ii, cc = np.meshgrid(
+            np.arange(n_fov), np.arange(n_channels), indexing="ij"
+        )
+        ii = ii.ravel()
+        cc = cc.ravel()
+        raw = obs.ravel()
+        keep = fov_ok[ii] & np.isfinite(raw) & (raw <= 1e8)
+        if not keep.any():
+            return pd.DataFrame()
+        ii = ii[keep]
+        cc = cc[keep]
+
+        def _angle(name: str) -> np.ndarray:
+            v = decoded[name][ii].astype(np.float32, copy=False)
+            return np.where(np.isfinite(v), v, np.float32(np.nan))
+
+        return pd.DataFrame(
+            {
+                "time": obs_time.iloc[ii].to_numpy(),
+                "lat": lat[ii].astype(np.float32, copy=False),
+                "lon": (lon[ii] % 360.0).astype(np.float32, copy=False),
+                # Always-NaN column, but typed so concat doesn't warn
+                # about "concatenation of empty/all-NA columns".
+                "scan_angle": np.full(ii.size, np.float32(np.nan), dtype=np.float32),
+                "channel_index": chan_arr[cc].astype(np.uint16),
+                "solza": _angle("solza"),
+                "solaza": _angle("solaza"),
+                "satellite_za": _angle("sat_za"),
+                "satellite_aza": _angle("sat_aza"),
+                "satellite": sat_name,
+                "observation": raw[keep].astype(np.float32, copy=False),
+                "variable": task.e2s_obs_name,
+            }
+        )
 
     # ------------------------------------------------------------------
     # eccodes helpers
