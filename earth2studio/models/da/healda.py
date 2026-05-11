@@ -174,6 +174,11 @@ class HealDA(torch.nn.Module, AutoModelMixin):
         ``lat_lon=True``, by default ``(181, 360)`` (1° resolution)
     time_tolerance : TimeTolerance, optional
         Time tolerance for filtering observations, by default (-21 hours, 3 hours)
+
+    Badges
+    ------
+    region:global class:da product:wind product:temp product:atmos product:sat
+    product:insitu year:2026 gpu:40gb
     """
 
     def __init__(
@@ -258,7 +263,7 @@ class HealDA(torch.nn.Module, AutoModelMixin):
                 "lon": np.empty(0, dtype=np.float32),
                 "observation": np.empty(0, dtype=np.float32),
                 "variable": np.array(list(SAT_SENSORS), dtype=str),
-                "channel_index": np.empty(0, dtype=np.uint16),
+                "channel_index": np.empty(0, dtype=np.uint16),  # UFS specific channels
                 "satellite": np.empty(0, dtype=str),
                 "scan_angle": np.empty(0, dtype=np.float32),
                 "satellite_za": np.empty(0, dtype=np.float32),

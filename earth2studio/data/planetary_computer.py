@@ -27,7 +27,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 from urllib.parse import urlparse
 
-import nest_asyncio
 import netCDF4
 import numpy as np
 import pygrib
@@ -36,7 +35,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from earth2studio.data import GOES
-from earth2studio.data.utils import datasource_cache_root, prep_data_inputs
+from earth2studio.data.utils import _sync_async, datasource_cache_root, prep_data_inputs
 from earth2studio.lexicon.base import LexiconType
 from earth2studio.lexicon.planetary_computer import (
     PlanetaryComputerECMWFOpenDataIFSLexicon,
@@ -214,18 +213,13 @@ class _PlanetaryComputerData:
         xr.DataArray
             Data array from planetary computer
         """
-        nest_asyncio.apply()
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        result = loop.run_until_complete(
-            asyncio.wait_for(self.fetch(time, variable), timeout=self._async_timeout)
-        )
-        if not self._cache:
-            shutil.rmtree(self.cache, ignore_errors=True)
+            result = _sync_async(
+                self.fetch, time, variable, timeout=self._async_timeout
+            )
+        finally:
+            if not self._cache:
+                shutil.rmtree(self.cache, ignore_errors=True)
         return result
 
     async def fetch(
@@ -583,6 +577,10 @@ class PlanetaryComputerOISST(_PlanetaryComputerData):
     Additional information on the data repository can be referenced here:
 
     - https://planetarycomputer.microsoft.com/dataset/noaa-cdr-sea-surface-temperature-optimum-interpolation
+
+    Badges
+    ------
+    region:global dataclass:observation product:ocean
     """
 
     COLLECTION_ID = "noaa-cdr-sea-surface-temperature-optimum-interpolation"
@@ -668,6 +666,10 @@ class PlanetaryComputerSentinel3AOD(_PlanetaryComputerData):
     Additional information on the data repository can be referenced here:
 
     - https://planetarycomputer.microsoft.com/dataset/sentinel-3-synergy-aod-l2-netcdf
+
+    Badges
+    ------
+    region:global dataclass:observation product:atmos product:sat
     """
 
     COLLECTION_ID = "sentinel-3-synergy-aod-l2-netcdf"
@@ -773,6 +775,10 @@ class PlanetaryComputerMODISFire(_PlanetaryComputerData):
     -------
     Tile searches are best-effort. If no tile identifiers are provided (the default),
     the first available tile returned by the Planetary Computer search is used.
+
+    Badges
+    ------
+    region:global dataclass:observation product:land product:sat
     """
 
     COLLECTION_ID = "modis-14A1-061"
@@ -937,6 +943,10 @@ class PlanetaryComputerECMWFOpenDataIFS(_PlanetaryComputerData):
     Additional information on the data repository can be referenced here:
 
     - https://planetarycomputer.microsoft.com/dataset/ecmwf-forecast
+
+    Badges
+    ------
+    region:global dataclass:analysis product:wind product:precip product:temp product:atmos
     """
 
     COLLECTION_ID = "ecmwf-forecast"
@@ -1078,6 +1088,10 @@ class PlanetaryComputerGOES(_PlanetaryComputerData):
     Additional information on the data repository can be referenced here:
 
     - https://planetarycomputer.microsoft.com/dataset/goes-cmi
+
+    Badges
+    ------
+    region:na dataclass:observation product:sat
     """
 
     COLLECTION_ID = "goes-cmi"
