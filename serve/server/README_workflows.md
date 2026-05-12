@@ -101,11 +101,11 @@ Implement the **`Workflow`** base class and assign the parameter class to its `P
 attribute:
 
 ```python
-from earth2studio.serve.server.workflow import Workflow, WorkflowProgress, workflow_registry
+from earth2studio.serve.server.workflow import Workflow, WorkflowProgress, WorkflowRegistry
 from typing import Any, Dict, Union
 import json
 
-@workflow_registry.register
+@WorkflowRegistry.instance().register
 class MyCustomWorkflow(Workflow):
     """My custom text processing workflow"""
 
@@ -431,7 +431,7 @@ Once registered, your workflow becomes available via REST API:
 <!-- markdownlint-disable MD013 -->
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| `GET` | `/v1/workflows` | List all available workflows |
+| `GET` | `/v1/infer/workflows` | List all available workflows |
 | `POST` | `/v1/infer/{workflow_name}` | Execute a workflow |
 | `GET` | `/v1/infer/{workflow_name}/{execution_id}/status` | Check execution status |
 | `GET` | `/v1/infer/{workflow_name}/{execution_id}/results` | Get results metadata with file manifest |

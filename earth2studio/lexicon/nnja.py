@@ -73,6 +73,7 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         "t": "prepbufr::TOB",
         "pres": "prepbufr::POB",
         # GPS Radio Occultation, from gps/gpsro/ archive
+<<<<<<< HEAD
         "gps": "gpsro::15037",
         "gps_t": "gpsro::12001",
         "gps_q": "gpsro::13001",
@@ -80,6 +81,16 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
 
     @classmethod
     def get_item(cls, val: str) -> tuple[str, Callable[..., pd.DataFrame]]:
+=======
+        # Removing these for now, consistency issues with UFS
+        # "gps": "gpsro::15037",
+        # "gps_t": "gpsro::12001",
+        # "gps_q": "gpsro::13001",
+    }
+
+    @classmethod
+    def get_item(cls, val: str) -> tuple[str, Callable]:
+>>>>>>> 3e27b0e34a010228ea22e466bab9a8cd66ec4dc8
         """Get item from the NNJA conventional vocabulary.
 
         Parameters
@@ -121,6 +132,7 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
                 return df
 
         return source_key, mod
+<<<<<<< HEAD
 
 
 class NNJASatelliteLexicon(metaclass=LexiconType):
@@ -190,3 +202,5 @@ class NNJASatelliteLexicon(metaclass=LexiconType):
             return df
 
         return nnja_key, mod
+=======
+>>>>>>> 3e27b0e34a010228ea22e466bab9a8cd66ec4dc8
