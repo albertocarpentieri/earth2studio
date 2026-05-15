@@ -21,6 +21,7 @@ Data sources that provide tabular data as DataFrames.
       :template: datasource.rst
 
       data.GHCNDaily
+      data.GOESGLM
       data.ISD
       data.JPSS_ATMS
       data.JPSS_CRIS
@@ -30,9 +31,13 @@ Data sources that provide tabular data as DataFrames.
       data.MetOpMHS
       data.NNJAObsConv
 <<<<<<< HEAD
+<<<<<<< HEAD
       data.NNJAObsSat
 =======
 >>>>>>> 3e27b0e34a010228ea22e466bab9a8cd66ec4dc8
+=======
+      data.NomadsGDASObsConv
+>>>>>>> 24696d5901f92adc6346b436a8f94db0792ce11e
       data.RandomDataFrame
       data.UFSObsConv
       data.UFSObsSat
