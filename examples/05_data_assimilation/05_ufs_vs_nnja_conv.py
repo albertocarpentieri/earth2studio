@@ -16,17 +16,18 @@
 
 # %%
 """
-UFS vs NNJA observations: source comparison
-===========================================
+UFS vs NNJA conventional observations: source comparison
+========================================================
 
-Side-by-side comparison of the two observation archives Earth2Studio
-exposes for data assimilation, **without** running any model.
+Side-by-side comparison of the two **conventional** observation
+archives Earth2Studio exposes for data assimilation, **without**
+running any model.
 
 The script fetches the same 6-hourly analysis cycle from both archives
 and renders three things per variable:
 
-1. A short text summary (row counts, lat/lon ranges, station/satellite
-   coverage, raw value range).
+1. A short text summary (row counts, lat/lon ranges, station coverage,
+   raw value range).
 2. Overlaid histograms of the ``observation`` column so the value
    distributions can be compared directly.
 3. Side-by-side global scatter maps showing where each archive has
@@ -34,12 +35,16 @@ and renders three things per variable:
 
 In this example you will learn:
 
-- How to query :py:class:`earth2studio.data.UFSObsConv`,
-  :py:class:`earth2studio.data.UFSObsSat`,
-  :py:class:`earth2studio.data.NNJAObsConv` and
-  :py:class:`earth2studio.data.NNJAObsSat` for a single cycle.
+- How to query :py:class:`earth2studio.data.UFSObsConv` and
+  :py:class:`earth2studio.data.NNJAObsConv` for a single cycle.
 - The practical differences between the two archives: schema columns,
   units, coverage, and value-range biases.
+
+.. note::
+   The NNJA satellite archive (``NNJAObsSat``) is no longer available
+   from the public bucket, so this example focuses on conventional
+   observations only. For satellite radiances use the independent
+   :py:class:`earth2studio.data.UFSObsSat` source.
 """
 # /// script
 # dependencies = [
@@ -70,20 +75,14 @@ logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
 
 os.makedirs("outputs", exist_ok=True)
 
-from earth2studio.data import NNJAObsConv, NNJAObsSat, UFSObsConv, UFSObsSat
-from earth2studio.lexicon import (
-    GSIConventionalLexicon,
-    GSISatelliteLexicon,
-    NNJAObsConvLexicon,
-    NNJASatelliteLexicon,
-)
+from earth2studio.data import NNJAObsConv, UFSObsConv
+from earth2studio.lexicon import GSIConventionalLexicon, NNJAObsConvLexicon
 
 ANALYSIS_TIME = datetime(2024, 6, 1, 0)
-# Asymmetric (-21 h, +3 h) window so the fetch covers the four
-# 6-hourly cycles ending at ``ANALYSIS_TIME`` plus the immediately
-# following one. This matches a typical 24 h analysis window and
-# gives dense global coverage for the per-type maps.
-TIME_TOLERANCE = (timedelta(hours=-1), timedelta(hours=1))
+# Symmetric +-3 h window: a single 6-hourly cycle centred on
+# ``ANALYSIS_TIME``. Wide enough to catch GOES / MODIS AMV types that
+# only fire on a subset of synoptic times within the cycle.
+TIME_TOLERANCE = (timedelta(hours=-3), timedelta(hours=3))
 
 # Conventional variables that exist in *both* lexicons (intersection),
 # so the histogram overlay is apples-to-apples.
@@ -91,33 +90,20 @@ SHARED_CONV_VARS = sorted(
     set(GSIConventionalLexicon.VOCAB.keys())
     & set(NNJAObsConvLexicon.VOCAB.keys())
 )
-SHARED_SAT_VARS = sorted(
-    set(GSISatelliteLexicon.VOCAB.keys())
-    & set(NNJASatelliteLexicon.VOCAB.keys())
-)
 
 logger.info(f"Shared conventional variables: {SHARED_CONV_VARS}")
-logger.info(f"Shared satellite variables:    {SHARED_SAT_VARS}")
 
 
 # %%
 # Fetch
 # -----
-# One call per (archive, kind). Both data sources accept a ``time``,
+# One call per archive. Both data sources accept a ``time``,
 # ``variable`` and (optional) ``fields`` argument and return a
 # :class:`pandas.DataFrame` with the columns named in their schema.
 
 # %%
 ufs_conv = UFSObsConv(time_tolerance=TIME_TOLERANCE)
-ufs_sat = UFSObsSat(time_tolerance=TIME_TOLERANCE)
 nnja_conv = NNJAObsConv(time_tolerance=TIME_TOLERANCE)
-# Restrict to a small fixed channel set so the hyperspectral sensors
-# (IASI ~616 channels, CrIS-FSR ~545 channels) do not balloon the
-# DataFrame to several hundred million rows per cycle file. Channel
-# indices are 1-based and cover the full range carried by the
-# microwave sensors (MHS=5, AMSU-A=15, ATMS=22) so they're unaffected.
-SAT_CHANNELS = list(range(1, 25))
-nnja_sat = NNJAObsSat(channels=SAT_CHANNELS, time_tolerance=TIME_TOLERANCE)
 
 
 def _safe_call(source, variables: list[str], label: str) -> pd.DataFrame:
@@ -132,24 +118,17 @@ def _safe_call(source, variables: list[str], label: str) -> pd.DataFrame:
 
 ufs_conv_df = _safe_call(ufs_conv, SHARED_CONV_VARS, "UFS conv")
 nnja_conv_df = _safe_call(nnja_conv, SHARED_CONV_VARS, "NNJA conv")
-ufs_sat_df = _safe_call(ufs_sat, SHARED_SAT_VARS, "UFS sat")
-nnja_sat_df = _safe_call(nnja_sat, SHARED_SAT_VARS, "NNJA sat")
 
 logger.info(
     f"Row counts -- UFS conv: {len(ufs_conv_df):>8,}  NNJA conv: {len(nnja_conv_df):>8,}"
-)
-logger.info(
-    f"Row counts -- UFS sat:  {len(ufs_sat_df):>8,}  NNJA sat:  {len(nnja_sat_df):>8,}"
 )
 
 
 # %%
 # Schema diff
 # -----------
-# Show the (set-)difference of column names between the two archives
-# of the same observation kind. Conventional schemas are deliberately
-# kept identical; satellite schemas differ (UFS has extra ``elev`` and
-# ``class`` columns; NNJA's optics columns are nullable).
+# Show the (set-)difference of column names between the two archives.
+# Conventional schemas are deliberately kept identical.
 
 # %%
 def _schema_diff(a: pd.DataFrame, b: pd.DataFrame, label_a: str, label_b: str) -> None:
@@ -165,15 +144,13 @@ def _schema_diff(a: pd.DataFrame, b: pd.DataFrame, label_a: str, label_b: str) -
 
 logger.info("--- conventional schema diff ---")
 _schema_diff(ufs_conv_df, nnja_conv_df, "UFS conv", "NNJA conv")
-logger.info("--- satellite schema diff ---")
-_schema_diff(ufs_sat_df, nnja_sat_df, "UFS sat", "NNJA sat")
 
 
 # %%
 # Per-variable summary
 # --------------------
 # A compact text table showing per-variable row counts, value range,
-# mean, and (for satellite) which platforms are represented.
+# mean, and unique-station coverage.
 
 # %%
 def _summarise(df: pd.DataFrame, var: str, label: str) -> dict:
@@ -194,8 +171,6 @@ def _summarise(df: pd.DataFrame, var: str, label: str) -> dict:
         "lat_min": float(sub["lat"].min()) if "lat" in sub else float("nan"),
         "lat_max": float(sub["lat"].max()) if "lat" in sub else float("nan"),
     }
-    if "satellite" in sub.columns:
-        record["platforms"] = sorted(sub["satellite"].dropna().unique().tolist())
     if "station" in sub.columns:
         record["unique_stations"] = int(sub["station"].dropna().nunique())
     return record
@@ -205,24 +180,21 @@ summary_rows: list[dict] = []
 for var in SHARED_CONV_VARS:
     summary_rows.append(_summarise(ufs_conv_df, var, "UFS"))
     summary_rows.append(_summarise(nnja_conv_df, var, "NNJA"))
-for var in SHARED_SAT_VARS:
-    summary_rows.append(_summarise(ufs_sat_df, var, "UFS"))
-    summary_rows.append(_summarise(nnja_sat_df, var, "NNJA"))
 
 summary_df = pd.DataFrame(summary_rows)
 summary_df = summary_df[summary_df["n"] > 0].reset_index(drop=True)
 print("\nPer-variable summary (rows with n>0):\n")
 with pd.option_context("display.max_rows", None, "display.width", 160):
     print(summary_df.to_string(index=False))
-summary_df.to_csv("outputs/05_ufs_vs_nnja_summary.csv", index=False)
+summary_df.to_csv("outputs/05_ufs_vs_nnja_conv_summary.csv", index=False)
 
 
 # %%
 # Distribution plots
 # ------------------
-# One figure per observation kind. Each row is a variable; left column
-# overlays the UFS and NNJA histograms (log y-axis to keep tail visible),
-# right column shows global scatter coverage on a Robinson projection.
+# One figure with one row per variable; left column overlays the UFS
+# and NNJA histograms (log y-axis to keep tail visible), right column
+# shows global scatter coverage on a Robinson projection.
 
 # %%
 import cartopy.crs as ccrs
@@ -350,7 +322,7 @@ def _plot_kind(
                 transform=ccrs.PlateCarree(),
                 label="NNJA",
             )
-        ax_map.set_title(f"{var}: coverage (subsample ≤ {SUBSAMPLE_FOR_MAP:,})")
+        ax_map.set_title(f"{var}: coverage (subsample <= {SUBSAMPLE_FOR_MAP:,})")
         if ufs_lat_s.size or nnja_lat_s.size:
             ax_map.legend(fontsize=8, loc="lower left")
 
@@ -367,13 +339,6 @@ _plot_kind(
     "UFS vs NNJA -- conventional",
     "outputs/05_ufs_vs_nnja_conv.jpg",
 )
-_plot_kind(
-    ufs_sat_df,
-    nnja_sat_df,
-    SHARED_SAT_VARS,
-    "UFS vs NNJA -- satellite",
-    "outputs/05_ufs_vs_nnja_sat.jpg",
-)
 
 
 # %%
@@ -389,7 +354,7 @@ _plot_kind(
 # Aligned with NCEP PrepBUFR Table 4 ("Report Types"):
 # https://emc.ncep.noaa.gov/mmb/data_processing/prepbufr.doc/table_4.htm
 TYPE_DESC_MAP: dict[int, str] = {
-    # ── Mass observations (1xx) ───────────────────────────────────────
+    # -- Mass observations (1xx) --
     120: "Rawinsonde",
     122: "Class-1 auto-launched dropsonde",
     126: "RASS (Radio Acoustic Sounding System)",
@@ -405,9 +370,9 @@ TYPE_DESC_MAP: dict[int, str] = {
     183: "Surface marine with missing pressure",
     187: "Surface land METAR (US format)",
     188: "Mesonet land surface",
-    # ── Synthetic / bogus ─────────────────────────────────────────────
+    # -- Synthetic / bogus --
     210: "Synthetic TC storm-center bogus winds",
-    # ── Wind observations (2xx) ───────────────────────────────────────
+    # -- Wind observations (2xx) --
     220: "Rawinsonde winds",
     221: "PIBAL (Pilot balloon) winds",
     223: "NOAA Profiler Network (NPN) winds",
@@ -421,7 +386,7 @@ TYPE_DESC_MAP: dict[int, str] = {
     233: "MDCRS ACARS aircraft winds",
     234: "TAMDAR aircraft winds",
     235: "Canadian AMDAR aircraft winds",
-    # ── Satellite-derived AMV winds (24x-26x) ─────────────────────────
+    # -- Satellite-derived AMV winds (24x-26x) --
     240: "NESDIS GOES IR (LW) cloud-drift AMV",
     241: "INSAT (India) satellite-derived AMV",
     242: "JMA visible cloud-drift AMV",
@@ -440,7 +405,7 @@ TYPE_DESC_MAP: dict[int, str] = {
     258: "MODIS (Aqua/Terra) WV cloud-top AMV",
     259: "MODIS (Aqua/Terra) WV deep-layer AMV",
     260: "VIIRS polar IR AMV",
-    # ── Surface-wind types (28x-29x) ──────────────────────────────────
+    # -- Surface-wind types (28x-29x) --
     280: "Surface marine winds (ship / buoy / C-MAN)",
     281: "Surface land synoptic / METAR winds",
     282: "ATLAS buoy winds (TAO / PIRATA / RAMA)",
@@ -470,7 +435,15 @@ CATEGORY_DEFS: list[dict[str, object]] = [
     {
         "name": "satellite_synthetic",
         "title": "Satellite & Synthetic Observations",
-        "types": [210, 242, 243, 250, 252, 253, 254, 257, 258, 259],
+        "types": [
+            210,
+            240, 245, 246, 247, 248, 251,
+            242, 252,
+            243, 253, 254,
+            250,
+            244, 260,
+            257, 258, 259,
+        ],
     },
 ]
 
@@ -578,12 +551,13 @@ for _cfg in CATEGORY_DEFS:
 # -----
 # - The UFS conv archive serves *GSI diagnostic* output, so values have
 #   already been QC'd and unit-normalised. NNJA serves the underlying
-#   PrepBUFR / GPS-RO / WMO-BUFR archive; unit conversion is performed
-#   by :py:class:`earth2studio.lexicon.NNJAObsConvLexicon` modifiers
-#   (TOB °C→K, QOB mg/kg→kg/kg, POB hPa→Pa).
-# - For satellite, the histograms compare radiance / brightness
-#   temperature in raw archive units. ``UFSObsSat`` returns extra
-#   ``elev`` and ``class`` columns that ``NNJAObsSat`` does not.
+#   PrepBUFR / GPS-RO archive; unit conversion is performed by
+#   :py:class:`earth2studio.lexicon.NNJAObsConvLexicon` modifiers
+#   (TOB degC->K, QOB mg/kg->kg/kg, POB hPa->Pa).
+# - The NNJA satellite radiance archive (``NNJAObsSat``) is no longer
+#   available from the public bucket. For satellite brightness
+#   temperatures use :py:class:`earth2studio.data.UFSObsSat`, which
+#   serves GSI-diagnostic radiances directly.
 # - If a variable has zero rows in one archive (e.g. an aircraft-only
 #   variable in a small tolerance window), only the present archive is
 #   shown for that row.

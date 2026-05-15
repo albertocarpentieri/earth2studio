@@ -42,11 +42,7 @@ from .metop_mhs import MetOpMHS
 from .mrms import MRMS
 from .ncar import NCAR_ERA5
 from .nclimgrid import NClimGridDaily
-<<<<<<< HEAD
-from .nnja import NNJAObsConv, NNJAObsSat
-=======
 from .nnja import NNJAObsConv
->>>>>>> 3e27b0e34a010228ea22e466bab9a8cd66ec4dc8
 from .planetary_computer import (
     PlanetaryComputerECMWFOpenDataIFS,
     PlanetaryComputerGOES,

@@ -73,15 +73,6 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         "t": "prepbufr::TOB",
         "pres": "prepbufr::POB",
         # GPS Radio Occultation, from gps/gpsro/ archive
-<<<<<<< HEAD
-        "gps": "gpsro::15037",
-        "gps_t": "gpsro::12001",
-        "gps_q": "gpsro::13001",
-    }
-
-    @classmethod
-    def get_item(cls, val: str) -> tuple[str, Callable[..., pd.DataFrame]]:
-=======
         # Removing these for now, consistency issues with UFS
         # "gps": "gpsro::15037",
         # "gps_t": "gpsro::12001",
@@ -90,7 +81,6 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
 
     @classmethod
     def get_item(cls, val: str) -> tuple[str, Callable]:
->>>>>>> 3e27b0e34a010228ea22e466bab9a8cd66ec4dc8
         """Get item from the NNJA conventional vocabulary.
 
         Parameters
@@ -132,75 +122,3 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
                 return df
 
         return source_key, mod
-<<<<<<< HEAD
-
-
-class NNJASatelliteLexicon(metaclass=LexiconType):
-    """NOAA-NASA Joint Archive (NNJA) lexicon for satellite-radiance BUFR
-    observations.
-
-    Maps Earth2Studio variable names to ``(sensor, source, platforms,
-    bufr_key)`` strings used by :py:class:`earth2studio.data.NNJAObsSat`
-    to template S3 paths and decode WMO-standard satellite BUFR files.
-
-    The vocab encoding is::
-
-        "<sensor>::<source>::<comma-separated platforms>::<bufr_key>"
-
-    where ``<sensor>`` and ``<source>`` are the first two NNJA bucket
-    path segments (``noaa-reanalyses-pds/observations/reanalysis/{sensor}/{source}/...``),
-    ``<platforms>`` is the comma-separated list of satellite platforms
-    that this sensor/source folder carries (used to filter when the user
-    restricts ``satellites=...`` at construction time), and
-    ``<bufr_key>`` is the eccodes BUFR key holding the radiance
-    observation (e.g. ``brightnessTemperature``, ``scaledIasiRadiance``).
-
-    Note
-    ----
-    Coverage starts narrow and grows as variables are tested. To request
-    a missing sensor please open an issue.
-
-    Additional resources:
-
-    - https://psl.noaa.gov/data/nnja_obs/
-    - https://registry.opendata.aws/noaa-reanalyses-obs/
-    """
-
-    VOCAB: dict[str, str] = {
-        "atms": "atms::atms::npp,n20::brightnessTemperature",
-        "amsua": "amsua::1bamua::n15,n16,n17,n18,n19,metop-a,metop-b,metop-c::brightnessTemperature",
-        "amsua_aqua": "amsua::nasa::aqua::brightnessTemperature",
-        "amsub": "amsub::1bamub::n15,n16,n17::brightnessTemperature",
-        "mhs": "mhs::1bmhs::n18,n19,metop-a,metop-b,metop-c::brightnessTemperature",
-        "iasi": "iasi::mtiasi::metop-a,metop-b,metop-c::scaledIasiRadiance",
-        "cris": "cris::cris::npp::radiance",
-        "crisfsr": "cris::crisf4::npp,n20::radiance",
-        "hirs": "hirs::1bhrs3::n15,n16,n17::brightnessTemperature",
-        "saphir": "saphir::saphir::megha-tropiques::brightnessTemperature",
-        "gmi": "gmi::gmi::gpm::brightnessTemperature",
-        "airs": "airs::airsev::aqua::scaledRadiance",
-    }
-
-    @classmethod
-    def get_item(cls, val: str) -> tuple[str, Callable[..., pd.DataFrame]]:
-        """Get item from satellite BUFR vocabulary.
-
-        Parameters
-        ----------
-        val : str
-            Earth2Studio variable id.
-
-        Returns
-        -------
-        tuple[str, Callable]
-            - NNJA vocab string ``"<sensor>::<source>::<platforms>::<bufr_key>"``.
-            - Identity modifier function (no DataFrame transformation).
-        """
-        nnja_key = cls.VOCAB[val]
-
-        def mod(df: pd.DataFrame) -> pd.DataFrame:
-            return df
-
-        return nnja_key, mod
-=======
->>>>>>> 3e27b0e34a010228ea22e466bab9a8cd66ec4dc8
