@@ -7,7 +7,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.15.0a0] - 2026-05-xx
+## [0.16.0a0] - xxxx-xx-xx
+
+### Added
+
+- Added AIFS 2.0 prognostic model (`AIFS2`) with wave and 10 hPa pressure level support
+- Added AIFS 2.0 ensemble prognostic model (`AIFS2ENS`) with stochastic noise injection
+- Added wave variables to IFS data source for AIFS2 support
+- Added NCEP CFSv2 operational forecast data sources for the pressure-level
+  `pgbf` and surface-flux `flxf` products (`CFS_FX`, `CFS_FX_Flux`), backed by
+  either NOMADS (real-time) or the AWS Open Data mirror (archive)
+- Added NCEP CFSv2 6-hourly 9-month reforecast data sources
+  (`CFS_Reforecast_FX`, `CFS_Reforecast_FX_Flux`), covering 1981-12-12
+  through 2011-03-27 with cycles every 5 days, served from the NCEI HTTPS
+  archive
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Dependencies
+
+- Removed `aifs` and `aifsens` from the `[all]` extra due to dependency conflicts with
+  `aifs2` (incompatible anemoi-models versions).
+
+## [0.15.0] - 2026-05-xx
 
 ### Added
 
@@ -17,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added GOES Geostationary Lightning Mapper L2 LCFA event data source (`GOESGLM`)
 - Added real-time GDAS conventional observation data source (`NomadsGDASObsConv`)
 - Added `quality` field to `E2STUDIO_SCHEMA` for observation QC markers
+- Added Climate in a Bottle tropical cyclone guidance and odds ration example
 
 ### Changed
 
@@ -25,10 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sensor_index` only which can be used to consistently map from UFS to L1 products
 - Added `wavenumber` (cm⁻¹) field to all satellite schemas
 - Changed `channel_index` to `sensor_index` in `E2STUDIO_SCHEMA`
-
-### Deprecated
-
-### Removed
+- Added Orbit-2 precipitation downscaling model
+- Disabled Atlas example from documentation build due to slow performance
 
 ### Fixed
 
@@ -36,12 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - S3 upload bug in server utilities
 - Fixed pres obs from UFS to be Pascal units
 - Fixed chunk downloading race condition in file system cache for Zarr data sources
-
-### Security
+- Fixed 180° longitude misalignment in ECMWF open-data sources for some GRIB files with
+  non-standard lon origin
 
 ### Dependencies
 
 - Removed nested_asyncio for Python 3.14 compatibility and updated async data sources
+- Bumping minimum ecmwf-opendata version to 0.3.29 to resolve IFS data request errors
 
 ## [0.14.0] - 2026-04-27
 
