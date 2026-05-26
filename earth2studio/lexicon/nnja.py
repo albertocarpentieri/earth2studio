@@ -72,11 +72,16 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         "q": "prepbufr::QOB",
         "t": "prepbufr::TOB",
         "pres": "prepbufr::POB",
-        # GPS Radio Occultation, from gps/gpsro/ archive
-        # Removing these for now, consistency issues with UFS
-        # "gps": "gpsro::15037",
-        # "gps_t": "gpsro::12001",
-        # "gps_q": "gpsro::13001",
+        # GPS Radio Occultation, from gps/gpsro/ archive.
+        # Note: the NNJA values are the raw BUFR measurements
+        # (bending angle, temperature, specific humidity at the impact
+        # parameter levels reported by the GNSS receiver), whereas the
+        # GSI ``conv::gps::*`` diagnostics are thinned, QC'd and
+        # interpolated onto pressure levels. The two are *not*
+        # row-for-row comparable; use them as independent data sources.
+        "gps": "gpsro::15037",
+        "gps_t": "gpsro::12001",
+        "gps_q": "gpsro::13001",
     }
 
     @classmethod

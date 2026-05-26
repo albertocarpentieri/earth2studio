@@ -84,14 +84,25 @@ ANALYSIS_TIME = datetime(2024, 6, 1, 0)
 # only fire on a subset of synoptic times within the cycle.
 TIME_TOLERANCE = (timedelta(hours=-3), timedelta(hours=3))
 
-# Conventional variables that exist in *both* lexicons (intersection),
-# so the histogram overlay is apples-to-apples.
-SHARED_CONV_VARS = sorted(
+# Variables that exist in *both* lexicons. We split them into two
+# groups because GPS-RO observations are not row-for-row comparable
+# between the two archives:
+#
+# - PrepBUFR conv (``u, v, q, t, pres``) -> values in the same SI
+#   units, can be overlaid on the same histogram axis.
+# - GPS-RO (``gps, gps_t, gps_q``) -> NNJA returns raw BUFR bending
+#   angle / T / Q at impact-parameter levels; UFS returns the same
+#   occultation after GSI thinning, QC and interpolation onto pressure
+#   levels. Plotted side-by-side, not overlaid.
+_SHARED_ALL = sorted(
     set(GSIConventionalLexicon.VOCAB.keys())
     & set(NNJAObsConvLexicon.VOCAB.keys())
 )
+SHARED_CONV_VARS = [v for v in _SHARED_ALL if not v.startswith("gps")]
+SHARED_GPSRO_VARS = [v for v in _SHARED_ALL if v.startswith("gps")]
 
 logger.info(f"Shared conventional variables: {SHARED_CONV_VARS}")
+logger.info(f"Shared GPS-RO variables:       {SHARED_GPSRO_VARS}")
 
 
 # %%
@@ -118,9 +129,22 @@ def _safe_call(source, variables: list[str], label: str) -> pd.DataFrame:
 
 ufs_conv_df = _safe_call(ufs_conv, SHARED_CONV_VARS, "UFS conv")
 nnja_conv_df = _safe_call(nnja_conv, SHARED_CONV_VARS, "NNJA conv")
+ufs_gpsro_df = (
+    _safe_call(ufs_conv, SHARED_GPSRO_VARS, "UFS GPS-RO")
+    if SHARED_GPSRO_VARS
+    else pd.DataFrame()
+)
+nnja_gpsro_df = (
+    _safe_call(nnja_conv, SHARED_GPSRO_VARS, "NNJA GPS-RO")
+    if SHARED_GPSRO_VARS
+    else pd.DataFrame()
+)
 
 logger.info(
     f"Row counts -- UFS conv: {len(ufs_conv_df):>8,}  NNJA conv: {len(nnja_conv_df):>8,}"
+)
+logger.info(
+    f"Row counts -- UFS gps:  {len(ufs_gpsro_df):>8,}  NNJA gps:  {len(nnja_gpsro_df):>8,}"
 )
 
 
@@ -180,6 +204,9 @@ summary_rows: list[dict] = []
 for var in SHARED_CONV_VARS:
     summary_rows.append(_summarise(ufs_conv_df, var, "UFS"))
     summary_rows.append(_summarise(nnja_conv_df, var, "NNJA"))
+for var in SHARED_GPSRO_VARS:
+    summary_rows.append(_summarise(ufs_gpsro_df, var, "UFS"))
+    summary_rows.append(_summarise(nnja_gpsro_df, var, "NNJA"))
 
 summary_df = pd.DataFrame(summary_rows)
 summary_df = summary_df[summary_df["n"] > 0].reset_index(drop=True)
@@ -338,6 +365,108 @@ _plot_kind(
     SHARED_CONV_VARS,
     "UFS vs NNJA -- conventional",
     "outputs/05_ufs_vs_nnja_conv.jpg",
+)
+
+
+# %%
+# GPS-RO: side-by-side, not overlaid
+# ----------------------------------
+# NNJA and UFS expose GPS-RO observations with fundamentally different
+# semantics (raw BUFR at impact-parameter levels vs GSI-thinned values
+# on pressure levels), so overlaying their histograms would be
+# misleading. Instead, render two separate histograms and two separate
+# coverage maps per variable.
+
+# %%
+def _plot_gpsro(
+    ufs_df: pd.DataFrame,
+    nnja_df: pd.DataFrame,
+    variables: list[str],
+    title: str,
+    out_path: str,
+) -> None:
+    if not variables:
+        logger.info(f"{title}: no shared GPS-RO variables to plot")
+        return
+    n_var = len(variables)
+    # Four columns per variable: UFS hist | NNJA hist | UFS map | NNJA map
+    fig = plt.figure(figsize=(20, 3.2 * n_var))
+    fig.suptitle(
+        f"{title}  (cycle {ANALYSIS_TIME.isoformat()} UTC)",
+        fontsize=14,
+        y=1.0,
+    )
+
+    for row, var in enumerate(variables):
+        ufs_obs, ufs_lat, ufs_lon = _values(ufs_df, var)
+        nnja_obs, nnja_lat, nnja_lon = _values(nnja_df, var)
+
+        ax_ufs_h = fig.add_subplot(n_var, 4, 4 * row + 1)
+        if ufs_obs.size:
+            ax_ufs_h.hist(ufs_obs, bins=60, color="C0", alpha=0.7)
+        ax_ufs_h.set_yscale("log")
+        ax_ufs_h.set_title(f"UFS {var} (n={ufs_obs.size:,})")
+        ax_ufs_h.set_xlabel("observation value")
+        ax_ufs_h.set_ylabel("count (log)")
+        ax_ufs_h.grid(alpha=0.3)
+
+        ax_nnja_h = fig.add_subplot(n_var, 4, 4 * row + 2)
+        if nnja_obs.size:
+            ax_nnja_h.hist(nnja_obs, bins=60, color="C3", alpha=0.7)
+        ax_nnja_h.set_yscale("log")
+        ax_nnja_h.set_title(f"NNJA {var} (n={nnja_obs.size:,})")
+        ax_nnja_h.set_xlabel("observation value")
+        ax_nnja_h.set_ylabel("count (log)")
+        ax_nnja_h.grid(alpha=0.3)
+
+        ax_ufs_m = fig.add_subplot(n_var, 4, 4 * row + 3, projection=PROJ)
+        ax_ufs_m.set_global()
+        ax_ufs_m.coastlines(linewidth=0.4)
+        ax_ufs_m.gridlines(linewidth=0.3, alpha=0.4)
+        ufs_s, ufs_lat_s, ufs_lon_s = _subsample(
+            ufs_obs, ufs_lat, ufs_lon, SUBSAMPLE_FOR_MAP
+        )
+        if ufs_lat_s.size:
+            ax_ufs_m.scatter(
+                ufs_lon_s,
+                ufs_lat_s,
+                s=3,
+                color="C0",
+                alpha=0.5,
+                transform=ccrs.PlateCarree(),
+            )
+        ax_ufs_m.set_title(f"UFS {var}: coverage")
+
+        ax_nnja_m = fig.add_subplot(n_var, 4, 4 * row + 4, projection=PROJ)
+        ax_nnja_m.set_global()
+        ax_nnja_m.coastlines(linewidth=0.4)
+        ax_nnja_m.gridlines(linewidth=0.3, alpha=0.4)
+        nnja_s, nnja_lat_s, nnja_lon_s = _subsample(
+            nnja_obs, nnja_lat, nnja_lon, SUBSAMPLE_FOR_MAP
+        )
+        if nnja_lat_s.size:
+            ax_nnja_m.scatter(
+                nnja_lon_s,
+                nnja_lat_s,
+                s=3,
+                color="C3",
+                alpha=0.5,
+                transform=ccrs.PlateCarree(),
+            )
+        ax_nnja_m.set_title(f"NNJA {var}: coverage")
+
+    fig.tight_layout(rect=(0, 0, 1, 0.99))
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Wrote {out_path}")
+
+
+_plot_gpsro(
+    ufs_gpsro_df,
+    nnja_gpsro_df,
+    SHARED_GPSRO_VARS,
+    "UFS vs NNJA -- GPS-RO (side-by-side, not directly comparable)",
+    "outputs/05_ufs_vs_nnja_gpsro.jpg",
 )
 
 
@@ -558,6 +687,13 @@ for _cfg in CATEGORY_DEFS:
 #   available from the public bucket. For satellite brightness
 #   temperatures use :py:class:`earth2studio.data.UFSObsSat`, which
 #   serves GSI-diagnostic radiances directly.
+# - GPS-RO (``gps``, ``gps_t``, ``gps_q``) is rendered in a separate
+#   ``05_ufs_vs_nnja_gpsro.jpg`` figure with side-by-side panels rather
+#   than overlays. The two archives are not row-for-row comparable for
+#   GPS-RO: NNJA reports raw BUFR bending angle / T / Q at impact-
+#   parameter levels (``gpsro::15037``, ``gpsro::12001``,
+#   ``gpsro::13001``), while UFS reports the same occultations after
+#   GSI thinning, QC and interpolation onto pressure levels.
 # - If a variable has zero rows in one archive (e.g. an aircraft-only
 #   variable in a small tolerance window), only the present archive is
 #   shown for that row.

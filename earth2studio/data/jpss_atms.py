@@ -713,19 +713,19 @@ class JPSS_ATMS:
                         )
                         if cqf_raw.size == n_channels:
                             # One flag per channel (shared across all FOVs)
-                            cqf = cqf_raw.astype(np.uint16)
+                            cqf = (cqf_raw & 0xFFFF).astype(np.uint16)
                         elif cqf_raw.size == n_fov * n_channels:
                             # Per-FOV per-channel: reshape to (n_channels, n_fov)
                             # and transpose to (n_fov, n_channels) so we can
                             # index cqf_per_fov[i, ch] later.
-                            cqf = cqf_raw.reshape(n_channels, n_fov).T.astype(np.uint16)
+                            cqf = (cqf_raw.reshape(n_channels, n_fov).T & 0xFFFF).astype(np.uint16)
                         elif cqf_raw.size >= n_channels:
                             # Unexpected size — take first n_channels entries
                             logger.debug(
                                 f"channelDataQualityFlags unexpected size "
                                 f"{cqf_raw.size}, using first {n_channels}"
                             )
-                            cqf = cqf_raw[:n_channels].astype(np.uint16)
+                            cqf = (cqf_raw[:n_channels] & 0xFFFF).astype(np.uint16)
                         else:
                             cqf = np.zeros(n_channels, dtype=np.uint16)
                     except Exception:
