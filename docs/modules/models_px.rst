@@ -35,6 +35,8 @@ Thus are typically used to generate forecast predictions.
 
       ACE2ERA5
       AIFS
+      AIFS2
+      AIFS2ENS
       AIFSENS
       Atlas
       Aurora
@@ -42,6 +44,8 @@ Thus are typically used to generate forecast predictions.
       DiagnosticWrapper
       DLESyM
       DLESyMLatLon
+      DLESyMv0_ISCCP_ERA5
+      DLESyMv0_ISCCP_ERA5LatLon
       DLWP
       FCN
       FCN3
@@ -59,3 +63,4 @@ Thus are typically used to generate forecast predictions.
       StormCast
       StormScopeGOES
       StormScopeMRMS
+      UCast

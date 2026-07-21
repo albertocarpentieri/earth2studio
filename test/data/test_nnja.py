@@ -23,7 +23,8 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from earth2studio.data import NNJAObsConv
+import earth2studio.data.nnja as nnja
+from earth2studio.data import NNJAObsConv, utils_ncep
 
 pytest.importorskip("pybufrkit", reason="pybufrkit not installed")
 
@@ -62,11 +63,14 @@ def test_nnja_obs_conv_cache_mock(cache, tmp_path):
             "pres": [85000.0, 92500.0],
             "elev": [100.0, 50.0],
             "type": [120, 120],
+            "level_cat": [0, 0],
             "class": ["ADPUPA", "ADPUPA"],
             "lat": [40.0, 41.0],
             "lon": [250.0, 251.0],
             "station": ["72469", "72469"],
             "station_elev": [1000.0, 1000.0],
+            "quality": [2, 2],
+            "pressure_quality": [1, 1],
             "observation": [273.15, 280.0],
             "variable": ["t", "t"],
         }
@@ -97,6 +101,9 @@ def test_nnja_obs_conv_exceptions():
     # Invalid source
     with pytest.raises(ValueError):
         NNJAObsConv(source="not_a_source", cache=False, verbose=False)
+
+    with pytest.raises(NotImplementedError, match="raw dump streams"):
+        NNJAObsConv(source="convbufr", cache=False, verbose=False)
 
     # Invalid variable - test via lexicon lookup directly (avoids network)
     with pytest.raises(KeyError):
@@ -209,11 +216,14 @@ def test_nnja_obs_conv_mock_fetch():
             "pres": [85000.0, 92500.0],
             "elev": [100.0, 50.0],
             "type": [120, 120],
+            "level_cat": [0, 0],
             "class": ["ADPUPA", "ADPUPA"],
             "lat": [40.0, 41.0],
             "lon": [250.0, 251.0],
             "station": ["72469", "72469"],
             "station_elev": [1000.0, 1000.0],
+            "quality": [2, 2],
+            "pressure_quality": [1, 1],
             "observation": [273.15, 280.0],
             "variable": ["t", "t"],
         }
@@ -264,7 +274,7 @@ def test_nnja_obs_conv_available():
 
 def test_nnja_safe_int():
     """Test _safe_int helper function with various input types."""
-    from earth2studio.data.nnja import _safe_int
+    from earth2studio.data.utils_bufr import safe_int as _safe_int
 
     # int/float inputs
     assert _safe_int(42) == 42
@@ -289,7 +299,7 @@ def test_nnja_safe_int():
 
 def test_nnja_extract_dx_tables_empty():
     """Test _extract_dx_tables with empty/minimal inputs."""
-    from earth2studio.data.nnja import _extract_dx_tables
+    from earth2studio.data.utils_bufr import extract_dx_tables as _extract_dx_tables
 
     table_b: dict = {}
     table_d: dict = {}
@@ -317,7 +327,7 @@ def test_nnja_extract_dx_tables_empty():
 
 def test_nnja_extract_dx_tables_truncated():
     """Test _extract_dx_tables with truncated/partial data."""
-    from earth2studio.data.nnja import _extract_dx_tables
+    from earth2studio.data.utils_bufr import extract_dx_tables as _extract_dx_tables
 
     table_b: dict = {}
     table_d: dict = {}
@@ -344,7 +354,7 @@ def test_nnja_extract_dx_tables_truncated():
 
 def test_nnja_extract_dx_tables_valid_entries():
     """Test _extract_dx_tables with valid Table B and D entries."""
-    from earth2studio.data.nnja import _extract_dx_tables
+    from earth2studio.data.utils_bufr import extract_dx_tables as _extract_dx_tables
 
     table_b: dict = {}
     table_d: dict = {}
@@ -423,7 +433,7 @@ def test_nnja_extract_dx_tables_valid_entries():
 
 def test_nnja_extract_dx_tables_table_d():
     """Test _extract_dx_tables Table D sequence entries."""
-    from earth2studio.data.nnja import _extract_dx_tables
+    from earth2studio.data.utils_bufr import extract_dx_tables as _extract_dx_tables
 
     table_b: dict = {}
     table_d: dict = {}
@@ -525,7 +535,7 @@ def test_nnja_obs_conv_create_tasks():
 
     # Test multiple variables (same route)
     tasks_multi = ds._create_tasks([datetime(2024, 1, 1, 0)], ["t", "u", "v"])
-    assert len(tasks_multi) == 1  # Same file, combined var_plan
+    assert len(tasks_multi) == 1  # Same file, combined extraction keys
     assert "t" in tasks_multi[0].var_plan
     assert "u" in tasks_multi[0].var_plan
     assert "v" in tasks_multi[0].var_plan
@@ -537,103 +547,55 @@ def test_nnja_obs_conv_create_tasks():
     assert len(tasks_times) == 2  # Two different cycles
 
 
-def test_nnja_obs_conv_finalize_decoded_df():
-    """Test _finalize_decoded_df with various inputs."""
-    ds = NNJAObsConv(cache=False, verbose=False)
+def test_nnja_obs_conv_create_tasks_gpsro_route():
+    ds = NNJAObsConv(time_tolerance=timedelta(0), cache=False, verbose=False)
 
-    # Import modifier function for testing
+    tasks = ds._create_tasks([datetime(2024, 1, 1, 0)], ["gps"])
+
+    assert len(tasks) == 1
+    assert isinstance(tasks[0], nnja._NNJAGpsRoTask)
+    assert "gpsro" in tasks[0].s3_uri
+    assert tasks[0].datetime_file == datetime(2024, 1, 1, 0)
+    assert tasks[0].var_plan["gps"][0] == utils_ncep.GPSRO_BNDA
+
+
+def test_nnja_obs_conv_create_tasks_mixed_prepbufr_and_gpsro():
+    ds = NNJAObsConv(time_tolerance=timedelta(0), cache=False, verbose=False)
+
+    tasks = ds._create_tasks([datetime(2024, 1, 1, 0)], ["gps", "t"])
+
+    assert len(tasks) == 2
+    conv_task = next(task for task in tasks if isinstance(task, nnja._NNJAConvTask))
+    gpsro_task = next(task for task in tasks if isinstance(task, nnja._NNJAGpsRoTask))
+    assert set(conv_task.var_plan) == {"t"}
+    assert set(gpsro_task.var_plan) == {"gps"}
+    assert gpsro_task.var_plan["gps"][0] == utils_ncep.GPSRO_BNDA
+
+
+def test_nnja_obs_conv_pres_modifier_keeps_station_pressure_only():
     from earth2studio.lexicon import NNJAObsConvLexicon
 
-    _, modifier = NNJAObsConvLexicon["t"]
+    _, modifier = NNJAObsConvLexicon["pres"]
 
-    # Empty rows
-    result = ds._finalize_decoded_df(
-        [], {"t": ("TOB", modifier)}, convert_pres_mb_to_pa=True
-    )
-    assert result.empty
-
-    # Rows with missing variable (should be filtered out)
-    rows = [
+    df = pd.DataFrame(
         {
-            "time": datetime(2024, 1, 1, 0),
-            "lat": 40.0,
-            "lon": 250.0,
-            "pres": 850.0,
-            "elev": None,
-            "type": 120,
-            "class": "ADPUPA",
-            "station": "72469",
-            "station_elev": 1000.0,
-            "observation": 273.15,
-            "variable": "other_var",  # Not in var_plan
+            "observation": [1000.0, 850.0, 850.0, 850.0, 850.0, 400.0, 850.0],
+            "type": [180, 181, 187, 120, 120, 180, 250],
+            "class": [
+                "SFCSHP",
+                "ADPSFC",
+                "ADPSFC",
+                "ADPUPA",
+                "ADPUPA",
+                "SFCSHP",
+                "SATWND",
+            ],
+            "level_cat": [0, 0, 0, 0, 1, 0, 0],
+            "quality": [2, 2, 2, 2, 2, 2, 2],
         }
-    ]
-    result = ds._finalize_decoded_df(
-        rows, {"t": ("TOB", modifier)}, convert_pres_mb_to_pa=True
-    )
-    assert result.empty  # No rows match "t"
-
-    # Rows with matching variable
-    rows_match = [
-        {
-            "time": datetime(2024, 1, 1, 0),
-            "lat": 40.0,
-            "lon": 250.0,
-            "pres": 850.0,
-            "elev": None,
-            "type": 120,
-            "class": "ADPUPA",
-            "station": "72469",
-            "station_elev": 1000.0,
-            "observation": 273.15,
-            "variable": "t",
-        }
-    ]
-    result = ds._finalize_decoded_df(
-        rows_match, {"t": ("TOB", modifier)}, convert_pres_mb_to_pa=True
-    )
-    assert len(result) == 1
-    # Check pressure conversion (850 mb -> 85000 Pa)
-    assert result["pres"].iloc[0] == pytest.approx(85000.0)
-
-    # Test without pressure conversion (gpsro path)
-    result_no_conv = ds._finalize_decoded_df(
-        rows_match, {"t": ("TOB", modifier)}, convert_pres_mb_to_pa=False
-    )
-    assert result_no_conv["pres"].iloc[0] == pytest.approx(850.0)
-
-
-def test_nnja_obs_conv_finalize_adds_missing_columns():
-    """Test _finalize_decoded_df adds missing nullable columns."""
-    ds = NNJAObsConv(cache=False, verbose=False)
-
-    from earth2studio.lexicon import NNJAObsConvLexicon
-
-    _, modifier = NNJAObsConvLexicon["t"]
-
-    # Rows missing some optional columns
-    rows = [
-        {
-            "time": datetime(2024, 1, 1, 0),
-            "lat": 40.0,
-            "lon": 250.0,
-            "pres": 850.0,
-            # "elev" missing
-            "type": 120,
-            "class": "ADPUPA",
-            # "station" missing
-            # "station_elev" missing
-            "observation": 273.15,
-            "variable": "t",
-        }
-    ]
-    result = ds._finalize_decoded_df(
-        rows, {"t": ("TOB", modifier)}, convert_pres_mb_to_pa=True
     )
 
-    # All schema columns should be present
-    assert list(result.columns) == list(ds.SCHEMA.names)
-    # Missing columns should be NaN/None
-    assert pd.isna(result["elev"].iloc[0])
-    assert result["station"].iloc[0] is None
-    assert pd.isna(result["station_elev"].iloc[0])
+    result = modifier(df)
+
+    assert result["observation"].tolist() == [100000.0, 85000.0, 85000.0, 85000.0]
+    assert result["type"].tolist() == [180, 181, 187, 120]

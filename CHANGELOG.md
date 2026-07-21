@@ -7,13 +7,122 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.15.0a0] - 2026-05-xx
+## [0.17.0a0] - 2026-07-xx
+
+### Added
+
+- Added GHCN hourly data source (`GHCNHourly`), superseding the deprecated ISD source
+- Added EarthMover ERA5 0.25 degree reanalysis data source
+- Added EarthMover IFS 0.1 degree data source and forecast source hosted by BrightBand
+- Added `async_workers` and `retries` parameters to GFS / GFS_FX, HRRR / HRRR_FX,
+  GEFS_FX / GEFS_FX_721x1440, CFS_FX / CFS_FX_Flux and NCAR_ERA5 data sources;
+  `async_workers` defaults to None which autoscales download concurrency to the
+  number of pending tasks (capped at 64)
+- Added shared obstore byte-range helpers (`obstore_store_from_url`,
+  `obstore_read_range`, `obstore_fetch_to_cache`) in `earth2studio.data.utils`
+
+### Changed
+
+- Renamed `GHCNLexicon` to `GHCNDailyLexicon` for consistency with the new hourly lexicon
+- Updated MeteosatFCI reader and lexicon to include all channels.
+- Updated StormScope model package to use improved higher resolution checkpoints. Model
+  now defaults to using 3 km and 10 minute spatiotemporal resolution, and includes
+  predictions for GOES GLM Lightning density.
+- Migrated GFS / GFS_FX data sources from s3fs to obstore for index and byte-range
+  GRIB fetches; downloads now use bounded concurrency with retry on transient errors
+- Migrated the remaining GRIB byte-range data sources (HRRR / HRRR_FX, GEFS_FX /
+  GEFS_FX_721x1440, CFS_FX / CFS_FX_Flux, NCAR_ERA5) from s3fs/gcsfs to obstore with
+  bounded concurrency and retry on transient errors
+- Migrated HTTP-backed GRIB sources (GFS `ncep`, HRRR `nomads`, CFS `nomads`) to
+  obstore `HTTPStore` against the NOMADS HTTPS endpoint (GFS `ncep` previously used
+  FTP); no fsspec fallbacks remain in the GRIB byte-range sources
+- Refactored UFS observation sources (`UFSObsConv`, `UFSObsSat`) onto the shared
+  obstore byte-range helpers
+- Zarr-reading data sources (`ARCO`, `WB2ERA5` and other WeatherBench 2 sources, and
+  the `rx` prescriptive sources) now read via `obstore`-backed zarr stores instead of
+  fsspec
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- Changed ISD schema `source` type to string since the field is alphanumeric. Enforced
+  `float32` dtypes for `lat`, `lon`, `elev`, and `observation`.
+- Fixed NNJA observation sources blocking the shared fsspec IO loop with
+  CPU-bound PrepBUFR decode work, which stalled concurrent fetches from other
+  data sources.
+- Fixed ACE2 distributed inference failures caused by nondeterministic variable ordering
+  across MPI ranks.
+- Improved ACE2ERA5 inference performance by caching yearly forcing values
+- Fixed ACE2ERA5 forcing data retrieval for static variables requested across
+  multiple times.
+
+### Security
+
+### Dependencies
+
+- Removed `multi-storage-client` from the `data` optional dependency group,
+  succeeded by `obstore`
+
+## [0.16.0] - 2026-06-29
+
+### Added
+
+- Added AIFS 2.0 prognostic model (`AIFS2`) with wave and 10 hPa pressure level support
+- Added AIFS 2.0 ensemble prognostic model (`AIFS2ENS`) with stochastic noise injection
+- Added U-CAST prognostic model (`UCast`) with 1.5-degree global ERA5
+  forecasting support
+- Added wave variables to IFS data source for AIFS2 support
+- Added NCEP CFSv2 operational forecast data sources for the pressure-level
+  `pgbf` and surface-flux `flxf` products (`CFS_FX`, `CFS_FX_Flux`), backed by
+  either NOMADS (real-time) or the AWS Open Data mirror (archive)
+- Added NCEP CFSv2 6-hourly 9-month reforecast data sources
+  (`CFS_Reforecast_FX`, `CFS_Reforecast_FX_Flux`), covering 1981-12-12
+  through 2011-03-27 with cycles every 5 days, served from the NCEI HTTPS
+  archive
+- Added IBTrACS tropical cyclone track DataFrame source (`IBTrACS`)
+- Added checkpoint/session utilities and restart support for deterministic,
+  diagnostic, and ensemble inference workflows
+- Added EUMETNET OPERA European weather radar composite DataSource for DBZH
+  reflectivity, rain rate, and 1-hour accumulation (`OPERA`)
+- Added support for cumulative variables in ARCO data source
+- Added DLESyM-v0-ISCCP-ERA5 climate model
+
+### Changed
+
+- UFS GSI observation sources (`UFSObsConv`, `UFSObsSat`) now fetch from S3 via native
+  `obstore` instead of `s3fs` to avoid the Python-GIL bottleneck that caps fsspec's
+  concurrent S3 read throughput (~22% faster obs fetch, ~20% HealDA e2e on B200; output unchanged).
+- Renamed AIFS runoff and snowfall variables to `ro06` and `sf06` and added six-hour
+  accumulated IFS/AIFS data aliases.
+- Automatic test skipping for missing optional dependencies via
+  `pytest_ignore_collect` hook in `test/conftest.py`
+
+### Fixed
+
+- Fixed ARCO data source `ARCO_TIME_STOP` fallback to 2025-12-31,
+  reflecting the most recent available data in the bucket
+- Fixed `ZarrBackend` chunk metadata reload to skip coordinate arrays when reopening Zarr stores.
+
+### Dependencies
+
+- Added `obstore>=0.8` for fetching UFS GSI observation data from S3.
+- Removed `aifs` and `aifsens` from the `[all]` extra due to dependency conflicts with
+  `aifs2` (incompatible anemoi-models versions).
+
+## [0.15.0] - 2026-05-25
 
 ### Added
 
 - Added Himawari-8/9 AHI ISatSS L2 Full Disk satellite data source (`HimawariAHI`)
 - Added GHCN-Daily global station observation data frame source (`GHCNDaily`)
 - Added NNJA conventional (in-situ + GPS RO) observation data source (`NNJAObsConv`)
+- Added GOES Geostationary Lightning Mapper L2 LCFA event data source (`GOESGLM`)
+- Added real-time GDAS conventional observation data source (`NomadsGDASObsConv`)
+- Added `quality` field to `E2STUDIO_SCHEMA` for observation QC markers
+- Added Climate in a Bottle tropical cyclone guidance and odds ration example
 
 ### Changed
 
@@ -22,21 +131,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sensor_index` only which can be used to consistently map from UFS to L1 products
 - Added `wavenumber` (cm⁻¹) field to all satellite schemas
 - Changed `channel_index` to `sensor_index` in `E2STUDIO_SCHEMA`
-
-### Deprecated
-
-### Removed
+- Added Orbit-2 precipitation downscaling model
+- Disabled Atlas example from documentation build due to slow performance
 
 ### Fixed
 
 - Fixed potential `uint16` underflow in UFS channel index expansion
 - S3 upload bug in server utilities
-
-### Security
+- Fixed pres obs from UFS to be Pascal units
+- Fixed chunk downloading race condition in file system cache for Zarr data sources
+- Fixed 180° longitude misalignment in ECMWF open-data sources for some GRIB files with
+  non-standard lon origin
 
 ### Dependencies
 
 - Removed nested_asyncio for Python 3.14 compatibility and updated async data sources
+- Bumping minimum ecmwf-opendata version to 0.3.29 to resolve IFS data request errors
 
 ## [0.14.0] - 2026-04-27
 

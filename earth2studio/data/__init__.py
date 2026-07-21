@@ -20,15 +20,25 @@ from .base import DataSource, ForecastSource
 from .cams import CAMS_FX
 from .cbottle import CBottle3D
 from .cds import CDS
+from .cfs import CFS_FX, CFS_FX_Flux
+from .cfs_reforecast import CFS_Reforecast_FX, CFS_Reforecast_FX_Flux
 from .cmip6 import CMIP6, CMIP6MultiRealm
 from .const import Constant, Constant_FX
+from .earthmover import (
+    EarthMoverBrightBandIFS,
+    EarthMoverBrightBandIFS_FX,
+    EarthMoverERA5,
+)
 from .ecmwf import AIFS_ENS_FX, AIFS_FX, IFS, IFS_ENS, IFS_ENS_FX, IFS_FX
+from .gdas import NomadsGDASObsConv
 from .gefs import GEFS_FX, GEFS_FX_721x1440
 from .gfs import GFS, GFS_FX
-from .ghcn import GHCNDaily
+from .ghcn import GHCNDaily, GHCNHourly
 from .goes import GOES
+from .goes_glm import GOESGLM, GOESGLMGrid
 from .himawari_ahi import HimawariAHI
 from .hrrr import HRRR, HRRR_FX
+from .ibtracs import IBTrACS
 from .isd import ISD
 from .jpss import JPSS
 from .jpss_atms import JPSS_ATMS
@@ -42,6 +52,7 @@ from .mrms import MRMS
 from .ncar import NCAR_ERA5
 from .nclimgrid import NClimGridDaily
 from .nnja import NNJAObsConv
+from .opera import OPERA
 from .planetary_computer import (
     PlanetaryComputerECMWFOpenDataIFS,
     PlanetaryComputerGOES,
