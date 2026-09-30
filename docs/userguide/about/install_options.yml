@@ -432,6 +432,15 @@ categories:
           - earth2studio.models.dx.PrecipitationAFNOv2
         warnings:
           - Precipitation AFNO V2 is deprecated and performs worse than V1.
+      - id: precip-diagnostic
+        label: Precipitation Diagnostic
+        extra: precip-diagnostic
+        summary: S2Transformer precipitation diagnostic model dependencies.
+        api_refs:
+          - earth2studio.models.dx.PrecipitationDiagnostic
+        warnings:
+          - Requires a PhysicsNeMo build that includes the experimental S2Transformer.
+          - No public package yet; weights load from a local package directory.
       - id: solarradiation-afno
         label: Solar Radiation AFNO
         extra: solarradiation-afno

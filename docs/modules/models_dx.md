@@ -39,6 +39,7 @@ earth2studio.models.dx.DLESyMv0_ISCCP_ERA5Precip
 earth2studio.models.dx.OrbitGlobalPrecip
 earth2studio.models.dx.PrecipitationAFNO
 earth2studio.models.dx.PrecipitationAFNOv2
+earth2studio.models.dx.PrecipitationDiagnostic
 earth2studio.models.dx.SolarRadiationAFNO1H
 earth2studio.models.dx.SolarRadiationAFNO6H
 earth2studio.models.dx.StormScopeDxNSRDB

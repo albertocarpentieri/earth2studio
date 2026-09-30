@@ -41,6 +41,9 @@ from earth2studio.models.dx.identity import Identity  # noqa
 from earth2studio.models.dx.orbit2_precip import OrbitGlobalPrecip  # noqa
 from earth2studio.models.dx.precipitation_afno import PrecipitationAFNO  # noqa
 from earth2studio.models.dx.precipitation_afno_v2 import PrecipitationAFNOv2  # noqa
+from earth2studio.models.dx.precipitation_diagnostic import (  # noqa
+    PrecipitationDiagnostic,
+)
 from earth2studio.models.dx.solarradiation_afno import (
     SolarRadiationAFNO1H,
     SolarRadiationAFNO6H,
@@ -62,6 +65,7 @@ __all__ = [
     "DLESyMv0_ISCCP_ERA5Precip",
     "PrecipitationAFNO",
     "PrecipitationAFNOv2",
+    "PrecipitationDiagnostic",
     "SolarRadiationAFNO1H",
     "SolarRadiationAFNO6H",
     "StormScopeDxNSRDB",

@@ -294,6 +294,10 @@ precip-afno = [
 precip-afno-v2 = [
     "nvidia-physicsnemo>=1.0.1",
 ]
+precip-diagnostic = [
+    "nvidia-physicsnemo>=2.0",
+    "torch-harmonics>=0.8.0",
+]
 solarradiation-afno = [
     "nvidia-physicsnemo>=1.0.1",
 ]
@@ -329,7 +333,7 @@ da-stormcast = [
 all = [
     "earth2studio[data,perturbation,statistics,utils,serve]",
     "earth2studio[atlas,aurora,camulator,dlwp,dlesym,fcn,fcn3,fengwu,fuxi,gencast,interp-modafno,pangu,stormcast,sfno,stormscope,graphcast,ucast,weathernext]",
-    "earth2studio[cbottle,climatenet,corrdiff,cosmo,corrdiff-era5-hrrr,orbit,precip-afno,cyclone,precip-afno-v2,solarradiation-afno,windgust-afno]",
+    "earth2studio[cbottle,climatenet,corrdiff,cosmo,corrdiff-era5-hrrr,orbit,precip-afno,cyclone,precip-afno-v2,precip-diagnostic,solarradiation-afno,windgust-afno]",
     "earth2studio[da-interp,da-stormcast,da-healda,da-cosmo]",
 ]
 
